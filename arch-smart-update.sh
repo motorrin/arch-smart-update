@@ -417,14 +417,14 @@ if [[ "$DAEMON_MODE" == true ]]; then
         for pid in $(pgrep -u "$EUID" 2>/dev/null); do
             if [[ -r "/proc/$pid/environ" ]]; then
                 proc_env=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n')
-                proc_disp=$(echo "$proc_env" | grep '^DISPLAY=')
-                proc_xauth=$(echo "$proc_env" | grep '^XAUTHORITY=')
-                proc_desktop=$(echo "$proc_env" | grep '^XDG_CURRENT_DESKTOP=')
+                proc_disp=$(echo "$proc_env" | awk -F= '/^DISPLAY=/ {print $2}')
+                proc_xauth=$(echo "$proc_env" | awk -F= '/^XAUTHORITY=/ {print $2}')
+                proc_desktop=$(echo "$proc_env" | awk -F= '/^XDG_CURRENT_DESKTOP=/ {print $2}')
 
                 if [[ -n "$proc_disp" ]]; then
-                    [[ -z "$DISPLAY" ]] && export "$proc_disp"
-                    [[ -z "$XAUTHORITY" && -n "$proc_xauth" ]] && export "$proc_xauth"
-                    [[ -z "$XDG_CURRENT_DESKTOP" && -n "$proc_desktop" ]] && export "$proc_desktop"
+                    [[ -z "$DISPLAY" ]] && export DISPLAY="$proc_disp"
+                    [[ -z "$XAUTHORITY" && -n "$proc_xauth" ]] && export XAUTHORITY="$proc_xauth"
+                    [[ -z "$XDG_CURRENT_DESKTOP" && -n "$proc_desktop" ]] && export XDG_CURRENT_DESKTOP="$proc_desktop"
                     break
                 fi
             fi
@@ -1700,7 +1700,6 @@ if [[ "$DAEMON_MODE" == true ]]; then
             echo "$pkg_count" > "$CACHE_FILE"
 
             if notify-send --help 2>&1 | grep -q -- "--action"; then
-                local TMP_NOTIFY
                 TMP_NOTIFY=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/asu_update.XXXXXX.sh")
                 cat <<EOF > "$TMP_NOTIFY"
 #!/bin/bash
