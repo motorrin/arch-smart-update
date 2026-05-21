@@ -741,16 +741,16 @@ get_current_mirror() {
 
 # shellcheck disable=SC2329
 launch_detached() {
-    local is_full_de=false
+    local is_systemd_de=false
     if [[ -n "$XDG_CURRENT_DESKTOP" ]]; then
         case "${XDG_CURRENT_DESKTOP^^}" in
-            *GNOME*|*KDE*|*PLASMA*|*XFCE*|*CINNAMON*|*MATE*|*LXQT*)
-                is_full_de=true
+            *GNOME*|*KDE*|*PLASMA*)
+                is_systemd_de=true
                 ;;
         esac
     fi
 
-    if $is_full_de && [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
+    if $is_systemd_de && [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
         local env_args=()
         [[ -n "$DISPLAY" ]] && env_args+=("-E" "DISPLAY=$DISPLAY")
         [[ -n "$WAYLAND_DISPLAY" ]] && env_args+=("-E" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
