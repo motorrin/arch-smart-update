@@ -671,7 +671,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
 export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}"
 export PATH="\$PATH:/usr/local/bin:/usr/bin:/bin"
 
-if [[ "\$XDG_CURRENT_DESKTOP" == *"XFCE"* ]]; then
+if [[ "\${XDG_CURRENT_DESKTOP,,}" == *"xfce"* || "\${XDG_CURRENT_DESKTOP,,}" == *"lxqt"* ]]; then
     action=\$(notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" --action="read=Read News" "Attention: Arch News detected!" "Published $diff_hours h. ago.\nCheck archlinux.org before updating.")
 else
     action=\$(notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" --action="default=Read News" --action="read=Read News" "Attention: Arch News detected!" "Published $diff_hours h. ago.\nCheck archlinux.org before updating.")
@@ -1719,7 +1719,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-}"
 export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}"
 export PATH="\$PATH:/usr/local/bin:/usr/bin:/bin"
 
-if [[ "\$XDG_CURRENT_DESKTOP" == *"XFCE"* ]]; then
+if [[ "\${XDG_CURRENT_DESKTOP,,}" == *"xfce"* || "\${XDG_CURRENT_DESKTOP,,}" == *"lxqt"* ]]; then
     action=\$(notify-send -a "Arch Smart Update" -u normal -i "$notif_icon" --action="update=Update Now" "Safe Updates Available" "Found $pkg_count updates ($aur_count AUR).\nReady to install.")
 else
     action=\$(notify-send -a "Arch Smart Update" -u normal -i "$notif_icon" --action="default=Update Now" --action="update=Update Now" "Safe Updates Available" "Found $pkg_count updates ($aur_count AUR).\nReady to install.")
@@ -2010,6 +2010,35 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                 $AUR_HELPER -Sc --noconfirm >/dev/null 2>&1
             else
                 sudo pacman -Sc --noconfirm >/dev/null 2>&1
+            fi
+
+            helper_bin=$(echo "${AUR_HELPER:-}" | awk '{print $1}')
+            helpers_to_clean=()
+            
+            if [[ -n "$helper_bin" ]]; then
+                helpers_to_clean+=("$helper_bin")
+            fi
+            
+            for h in "yay" "paru" "pikaur" "trizen" "pacaur"; do
+                if [[ "$h" != "$helper_bin" ]]; then
+                    helpers_to_clean+=("$h")
+                fi
+            done
+
+            cleaned_aur="false"
+            for h in "${helpers_to_clean[@]}"; do
+                if [[ -d "$USER_HOME/.cache/$h" ]]; then
+                    if [[ "$cleaned_aur" == "false" ]]; then
+                        echo -e "${dim}Clearing AUR helper build caches...${reset}"
+                        cleaned_aur="true"
+                    fi
+                    rm -rf "$USER_HOME/.cache/$h" 2>/dev/null
+                fi
+            done
+
+            if command -v flatpak >/dev/null 2>&1; then
+                echo -e "${dim}Removing unused Flatpak runtimes...${reset}"
+                flatpak uninstall --unused -y >/dev/null 2>&1
             fi
 
             echo -e "${dim}Vacuuming systemd journal (keeping 100M)...${reset}"
