@@ -63,7 +63,7 @@ The script recognizes hundreds of packages (from DEs to base system components) 
   > *Recommendation:* Wait **6 hours**.
 - **📦 Standard Packages & AUR:**
   > *Recommendation:* Wait **3 hours**.
-- **💡 Customizing the lists:** You don't have to wait for an update to add your specific apps to these categories! You can easily append your own packages to the NUKE, CRIT, or FEAT lists using the user_packages.conf file, and your changes will survive all future script updates.
+- **💡 Customizing the lists:** You don't have to wait for an update to add your specific apps to these categories! You can easily append your own packages to the NUKE, CRIT, or FEAT lists using the settings.conf file, and your changes will survive all future script updates.
 
 ---
 
@@ -92,9 +92,9 @@ Whenever the master configuration on GitHub is updated, the script will quietly 
 
 The script relies on standard system utilities, but make sure you have the following packages installed:
 
-`sudo pacman -S curl python bash tar gawk coreutils psmisc`
+`sudo pacman -S curl python bash tar gawk coreutils psmisc util-linux`
 
-*(Note: The `python` package provides `python3` for the Arch News RSS check, and `psmisc` provides the `fuser` command required for smart lock file management).*
+*(Note: The python package provides python3 for the Arch News RSS check, psmisc provides the fuser command required for smart lock file management, and util-linux provides the script utility used for interactive terminal emulation).*
 
 **Optional Dependencies:**
 - `base-devel` (specifically `fakeroot`) — Required for the background daemon to sync databases without sudo privileges.
