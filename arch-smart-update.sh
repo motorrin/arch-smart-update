@@ -26,7 +26,7 @@ log_step() {
 }
 
 # --- 1.2 Dependency Check ---
-for cmd in python3 tar awk stat fuser curl; do
+for cmd in python3 tar awk stat fuser curl script; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${red}Error: Required command '$cmd' is not installed.${reset}"
         if [[ "$cmd" == "fuser" ]]; then
@@ -825,6 +825,14 @@ backup_pacman_db() {
         if [[ ! "$cont" =~ ^[Yy]$ ]]; then
             exit 1
         fi
+    fi
+}
+
+run_interactive_task() {
+    if [ -t 0 ]; then
+        SHELL=/bin/bash script -e -q -f -c "$1" /dev/null
+    else
+        /bin/bash -c "$1"
     fi
 }
 
@@ -1955,7 +1963,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
         for cmd in "${CUSTOM_CMDS[@]}"; do
             echo -e "${dim}Executing: ${white}$cmd${reset}"
-            bash -c "$cmd"
+            run_interactive_task "$cmd"
             core_exit=$?
 
             if [[ $core_exit -ne 0 ]]; then
@@ -2005,7 +2013,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             tool_name="$BEST_UPDATE_TOOL"
 
             echo -e "${blue}${bold}Running $tool_name (Keyrings & Packages)...${reset}\n"
-            $tool_name
+            run_interactive_task "$tool_name"
             core_exit=$?
 
             pending_updates=$(check_pending_updates "repo_only")
@@ -2013,13 +2021,13 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             if [[ -z "$pending_updates" && $core_exit -eq 0 ]]; then
                 echo -e "\n${green}Core updates applied successfully.${reset}"
                 echo -e "\n${blue}${bold}Running Topgrade (Firmware, Flatpaks, Dotfiles)...${reset}\n"
-                topgrade && UPDATE_SUCCESS=true
+                run_interactive_task "topgrade" && UPDATE_SUCCESS=true
             else
                 echo -e "\n${yellow}$tool_name was cancelled or did not fully apply updates.${reset}"
                 echo -ne "${white}Run topgrade anyway? (Flatpaks/AUR etc) [y/N]: ${reset}"
                 read -r force_extra
                 if [[ "$force_extra" =~ ^[Yy]$ ]]; then
-                    topgrade && UPDATE_SUCCESS=true
+                    run_interactive_task "topgrade" && UPDATE_SUCCESS=true
                 else
                     echo -e "${dim}Skipping extra updates.${reset}\n"
                 fi
@@ -2029,7 +2037,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             tool_name="$BEST_UPDATE_TOOL"
 
             echo -e "${blue}${bold}Running $tool_name...${reset}\n"
-            $tool_name
+            run_interactive_task "$tool_name"
             core_exit=$?
 
             pending_updates=$(check_pending_updates)
@@ -2049,7 +2057,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                     read -r force_aur
 
                     if [[ "$force_aur" =~ ^[Yy]$ || -z "$force_aur" ]]; then
-                        $AUR_HELPER $aur_flags
+                        run_interactive_task "$AUR_HELPER $aur_flags"
 
                         if [[ $? -eq 0 && -z "$(check_pending_updates)" ]]; then
                             UPDATE_SUCCESS=true
@@ -2066,15 +2074,15 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
         elif [[ "$HAS_TOPGRADE" == "true" ]]; then
             echo -e "${blue}${bold}Running Topgrade (System, AUR, Firmware, etc.)...${reset}\n"
-            topgrade && UPDATE_SUCCESS=true
+            run_interactive_task "topgrade" && UPDATE_SUCCESS=true
 
         else
             echo -e "${blue}${bold}Running standard system update...${reset}\n"
             if [[ -n "$AUR_HELPER" ]]; then
-                $AUR_HELPER -Syu
+                run_interactive_task "$AUR_HELPER -Syu"
                 core_exit=$?
             else
-                sudo pacman -Syu
+                run_interactive_task "sudo pacman -Syu"
                 core_exit=$?
             fi
 
