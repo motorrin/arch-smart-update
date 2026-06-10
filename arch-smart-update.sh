@@ -21,6 +21,11 @@ else
     magenta='' cyan='' white='' gray='' bg_crit='' bg_nuke='' bg_feat=''
 fi
 
+if [[ "$EUID" -eq 0 ]]; then
+    echo -e "${red}Error: Please run '$(basename "$0")' without sudo.${reset}"
+    exit 1
+fi
+
 log_step() {
     echo -e "${dim}[$(date +%T)] $1${reset}"
 }
@@ -54,12 +59,19 @@ prompt_user() {
 }
 
 # --- 2. Configuration & External Files ---
-if [[ -n "$SUDO_USER" ]]; then
-    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-else
-    USER_HOME=$HOME
-fi
+USER_HOME=$HOME
 CONFIG_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/arch-smart-update"
+
+if ! $DAEMON_MODE && [ -d "$CONFIG_DIR" ]; then
+    if [[ "$(stat -Lc '%u' "$CONFIG_DIR" 2>/dev/null)" == "0" ]] || find "$CONFIG_DIR" -user root -print -quit 2>/dev/null | grep -q .; then
+        echo -e "${yellow}Detected files owned by root in config directory. Fixing ownership...${reset}"
+        if ! sudo chown -R "$(id -u):$(id -g)" "$CONFIG_DIR"; then
+            echo -e "${red}Error: Failed to fix ownership of config directory. Exiting.${reset}"
+            exit 1
+        fi
+    fi
+fi
+
 mkdir -p "$CONFIG_DIR"
 
 PKG_CONF="$CONFIG_DIR/packages.conf"
@@ -114,9 +126,10 @@ validate_user_conf() {
     [[ ! -f "$file" ]] && return 0
 
     local owner
-    owner=$(stat -Lc '%U' "$file" 2>/dev/null)
-    local real_user="${SUDO_USER:-$(id -un)}"
-    if [[ "$owner" != "$real_user" && "$owner" != "root" ]]; then
+    owner=$(stat -Lc '%u' "$file" 2>/dev/null)
+    local real_user
+    real_user="$(id -u)"
+    if [[ "$owner" != "$real_user" && "$owner" != "0" ]]; then
         echo -e "${bg_nuke}SECURITY ${reset} ${red}$label is owned by '${owner:-UNKNOWN}', expected '$real_user' or 'root'. Refusing to load.${reset}"
         return 1
     fi
@@ -293,11 +306,6 @@ for pkg in "${FEATURE_PKGS[@]}"; do FEAT_MAP["$pkg"]=1; done
 sync_daemon_state() {
     local QUIET=false
     [[ "$DAEMON_MODE" == true ]] && QUIET=true
-
-    if [[ "$EUID" -eq 0 ]]; then
-        $QUIET || echo -e "${yellow}Warning: Script run as root. Skipping systemd user daemon configuration.${reset}"
-        return 0
-    fi
 
     local SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
 
@@ -520,6 +528,7 @@ if ! CHECK_DB=$(mktemp -d /tmp/checkupdates-db.XXXXXX); then
     echo -e "${red}Error: Could not create temp db directory.${reset}"
     exit 1
 fi
+chmod 755 "$CHECK_DB"
 
 # shellcheck disable=SC2329
 cleanup() {
@@ -528,15 +537,9 @@ cleanup() {
     fi
 
     if [[ -n "$CHECK_DB" && -d "$CHECK_DB" && "$CHECK_DB" == /tmp/* && "$CHECK_DB" != "/tmp/" ]]; then
-        rm -rf "$CHECK_DB" 2>/dev/null
-
+        rm -rf -- "$CHECK_DB" 2>/dev/null
         if [[ -d "$CHECK_DB" ]]; then
-            sudo -n rm -rf -- "$CHECK_DB" 2>/dev/null
-
-            if [[ -d "$CHECK_DB" ]]; then
-                echo -e "\n\r\033[2K${yellow}Cleaning up temporary RAM files (/tmp)... Password required.${reset}"
-                sudo rm -rf -- "$CHECK_DB"
-            fi
+            sudo rm -rf -- "$CHECK_DB" 2>/dev/null
         fi
     fi
 
@@ -1130,10 +1133,17 @@ if [[ "$did_prompt_mirrors" == false ]] && [[ "${PROMPT_MIRROR_REFRESH,,}" == "t
 fi
 
 log_step "Copying local DB..."
-cp -a --no-preserve=ownership /var/lib/pacman/local "$CHECK_DB/" > /dev/null 2>&1
-
-if ! $DAEMON_MODE; then
-    sudo chown -R root:root "$CHECK_DB"
+if $DAEMON_MODE; then
+    if ! cp -a --no-preserve=ownership /var/lib/pacman/local "$CHECK_DB/" > /dev/null 2>&1; then
+        log_step "Error: Failed to copy local DB."
+        exit 1
+    fi
+else
+    if ! sudo cp -a /var/lib/pacman/local "$CHECK_DB/" > /dev/null 2>&1; then
+        echo -e "${red}Error: Failed to copy local DB.${reset}"
+        exit 1
+    fi
+    sudo chown -R "$(id -u):$(id -g)" "$CHECK_DB"
     sudo chmod 755 "$CHECK_DB"
 fi
 
@@ -1152,7 +1162,7 @@ while (( attempt <= MAX_RETRIES )); do
         env LC_ALL=C fakeroot pacman $PACMAN_OPTS -Sy --dbpath "$CHECK_DB" --logfile /dev/null 2>&1 | tee "$SYNC_LOG"
         PACMAN_EXIT=${PIPESTATUS[0]}
     else
-        env LC_ALL=C sudo pacman -Sy --dbpath "$CHECK_DB" --logfile /dev/null 2>&1 | tee "$SYNC_LOG"
+        sudo env LC_ALL=C pacman -Sy --dbpath "$CHECK_DB" --logfile /dev/null 2>&1 | tee "$SYNC_LOG"
         PACMAN_EXIT=${PIPESTATUS[0]}
     fi
 
@@ -1200,11 +1210,11 @@ while (( attempt <= MAX_RETRIES )); do
     fi
 done
 
-log_step "Calculating update list (pacman -Qu)..."
-
 if ! $DAEMON_MODE; then
-    sudo chown -R "$(id -un):$(id -gn)" "$CHECK_DB"
+    sudo chown -R "$(id -u):$(id -g)" "$CHECK_DB"
 fi
+
+log_step "Calculating update list (pacman -Qu)..."
 
 ignored_pkgs=$(pacman-conf IgnorePkg 2>/dev/null | tr ' ' '\n')
 ignored_groups=$(pacman-conf IgnoreGroup 2>/dev/null | tr ' ' '\n')
