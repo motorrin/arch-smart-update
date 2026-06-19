@@ -21,6 +21,17 @@ else
     magenta='' cyan='' white='' gray='' bg_crit='' bg_nuke='' bg_feat=''
 fi
 
+if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+    echo -e "${blue}${bold}Arch Smart Update${reset}"
+    echo -e "\nUsage: ${white}${0##*/}${reset} [options]\n"
+    echo -e "Options:"
+    echo -e "  ${cyan}(no arguments)${reset}  Run this to manually inspect pending updates in a detailed layout and choose when to install them."
+    echo -e "  ${cyan}--daemon${reset}        Run this in the background to automatically monitor updates and receive a desktop notification when they are ready."
+    echo -e "  ${cyan}--check${reset}         Run a single, quiet scan right now to check for updates and test your notification settings without keeping a service running."
+    echo -e "  ${cyan}--help, -h${reset}      Display this help screen showing all available options."
+    exit 0
+fi
+
 if [[ "$EUID" -eq 0 ]]; then
     echo -e "${red}Error: Please run '$(basename "$0")' without sudo.${reset}"
     exit 1
