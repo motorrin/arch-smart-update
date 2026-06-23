@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# --- 1.1 Color Palette ---
+# --- 1. Initialization & Environment Setup ---
 if [ -t 1 ]; then
     reset='\033[0m'
     bold='\033[1m'
@@ -41,7 +41,6 @@ log_step() {
     echo -e "${dim}[$(date +%T)] $1${reset}"
 }
 
-# --- 1.2 Dependency Check ---
 for cmd in python3 tar awk stat fuser curl; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${red}Error: Required command '$cmd' is not installed.${reset}"
@@ -52,13 +51,11 @@ for cmd in python3 tar awk stat fuser curl; do
     fi
 done
 
-# --- 1.3 Daemon mode ---
 DAEMON_MODE=false
 if [[ "$1" == "--daemon" || "$1" == "--check" ]]; then
     DAEMON_MODE=true
 fi
 
-# --- 1.4 Helper: Prompt ---
 prompt_user() {
     local msg="$1" options="$2" var_name="$3"
     local user_input=""
@@ -262,11 +259,19 @@ fi
 
 if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
     while IFS= read -r line; do
-        [[ "$line" =~ ^[[:space:]]*#.*$ || -z "$line" || "$line" != *"="* ]] && continue
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" == "#"* || "$line" != *"="* ]] && continue
         key="${line%%=*}"
         val="${line#*=}"
         val="${val%$'\r'}"
-        [[ "$val" == \"*\" || "$val" == \'*\' ]] && val="${val:1:-1}"
+        key="${key#"${key%%[![:space:]]*}"}"
+        key="${key%"${key##*[![:space:]]}"}"
+        val="${val#"${val%%[![:space:]]*}"}"
+        val="${val%"${val##*[![:space:]]}"}"
+        if [[ "$val" == \"*\" && "$val" == *\" ]] || [[ "$val" == \'*\' && "$val" == *\' ]]; then
+            val="${val:1:-1}"
+        fi
 
         case "$key" in
             AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP)
@@ -435,23 +440,30 @@ if [[ "$DAEMON_MODE" == true ]]; then
     if [[ -z "$DISPLAY" || -z "$XAUTHORITY" || -z "$XDG_CURRENT_DESKTOP" || -z "$DBUS_SESSION_BUS_ADDRESS" || -z "$XDG_DATA_DIRS" ]]; then
         for pid in $(pgrep -u "$EUID" 2>/dev/null); do
             if [[ -r "/proc/$pid/environ" ]]; then
-                proc_env=$(cat "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n')
-                proc_disp=$(echo "$proc_env" | awk -F= '/^DISPLAY=/ {print $2}')
-                proc_xauth=$(echo "$proc_env" | awk -F= '/^XAUTHORITY=/ {print $2}')
-                proc_desktop=$(echo "$proc_env" | awk -F= '/^XDG_CURRENT_DESKTOP=/ {print $2}')
+                p_disp=""
+                p_xauth=""
+                p_desktop=""
+                p_dbus=""
+                p_data=""
+                p_config=""
+                while IFS='=' read -r -d '' env_key env_val; do
+                    case "$env_key" in
+                        DISPLAY) p_disp="$env_val" ;;
+                        XAUTHORITY) p_xauth="$env_val" ;;
+                        XDG_CURRENT_DESKTOP) p_desktop="$env_val" ;;
+                        DBUS_SESSION_BUS_ADDRESS) p_dbus="$env_val" ;;
+                        XDG_DATA_DIRS) p_data="$env_val" ;;
+                        XDG_CONFIG_DIRS) p_config="$env_val" ;;
+                    esac
+                done < <(cat "/proc/$pid/environ" 2>/dev/null)
 
-                if [[ -n "$proc_disp" ]]; then
-                    [[ -z "$DISPLAY" ]] && export DISPLAY="$proc_disp"
-                    [[ -z "$XAUTHORITY" && -n "$proc_xauth" ]] && export XAUTHORITY="$proc_xauth"
-                    [[ -z "$XDG_CURRENT_DESKTOP" && -n "$proc_desktop" ]] && export XDG_CURRENT_DESKTOP="$proc_desktop"
-
-                    proc_dbus=$(echo "$proc_env" | awk -F= '/^DBUS_SESSION_BUS_ADDRESS=/ {print $2}')
-                    proc_data=$(echo "$proc_env" | awk -F= '/^XDG_DATA_DIRS=/ {print $2}')
-                    proc_config=$(echo "$proc_env" | awk -F= '/^XDG_CONFIG_DIRS=/ {print $2}')
-
-                    [[ -z "$DBUS_SESSION_BUS_ADDRESS" && -n "$proc_dbus" ]] && export DBUS_SESSION_BUS_ADDRESS="$proc_dbus"
-                    [[ -z "$XDG_DATA_DIRS" && -n "$proc_data" ]] && export XDG_DATA_DIRS="$proc_data"
-                    [[ -z "$XDG_CONFIG_DIRS" && -n "$proc_config" ]] && export XDG_CONFIG_DIRS="$proc_config"
+                if [[ -n "$p_disp" ]]; then
+                    [[ -z "$DISPLAY" ]] && export DISPLAY="$p_disp"
+                    [[ -z "$XAUTHORITY" && -n "$p_xauth" ]] && export XAUTHORITY="$p_xauth"
+                    [[ -z "$XDG_CURRENT_DESKTOP" && -n "$p_desktop" ]] && export XDG_CURRENT_DESKTOP="$p_desktop"
+                    [[ -z "$DBUS_SESSION_BUS_ADDRESS" && -n "$p_dbus" ]] && export DBUS_SESSION_BUS_ADDRESS="$p_dbus"
+                    [[ -z "$XDG_DATA_DIRS" && -n "$p_data" ]] && export XDG_DATA_DIRS="$p_data"
+                    [[ -z "$XDG_CONFIG_DIRS" && -n "$p_config" ]] && export XDG_CONFIG_DIRS="$p_config"
                     break
                 fi
             fi
