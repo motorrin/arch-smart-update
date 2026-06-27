@@ -304,6 +304,11 @@ if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         [[ -z "$line" || "$line" == "#"* || "$line" != *"="* ]] && continue
+
+        line="${line%%[[:space:]]#*}"
+        line="${line%"${line##*[![:space:]]}"}"
+        [[ -z "$line" || "$line" != *"="* ]] && continue
+
         key="${line%%=*}"
         val="${line#*=}"
         val="${val%$'\r'}"
@@ -736,7 +741,7 @@ except Exception:
         now_time=$(date +%s)
         diff_hours=$(( (now_time - news_ts) / 3600 ))
 
-        if (( diff_hours < 336 )); then # 14 days
+        if (( diff_hours < 336 )); then
             local NEWS_CACHE="$CONFIG_DIR/news.cache"
             local OLD_NEWS_TS=0
             local NEWS_SILENCED=false
@@ -927,7 +932,7 @@ execute_update_task() {
     local cmd="$1"
 
     if [[ "${ASU_TTY_OUT:-}" =~ ^[0-9]+$ ]] && [[ "${ASU_TTY_ERR:-}" =~ ^[0-9]+$ ]] && [ -t "$ASU_TTY_OUT" ] && [ -t 0 ]; then
-        /bin/bash -c "$cmd" 1>&$ASU_TTY_OUT 2>&$ASU_TTY_ERR <&0
+        /bin/bash -c "$cmd" 1>&$ASU_TTY_OUT 2>&$ASU_TTY_ERR
         return
     fi
 
@@ -2210,13 +2215,27 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             if [[ -z "$pending_updates" && $core_exit -eq 0 ]]; then
                 echo -e "\n${green}Core updates applied successfully.${reset}"
                 echo -e "\n${blue}${bold}Running Topgrade (Firmware, Flatpaks, Dotfiles)...${reset}\n"
-                execute_update_task "topgrade" && UPDATE_SUCCESS=true
+                execute_update_task "topgrade"
+                topgrade_exit=$?
+                UPDATE_SUCCESS=true
+                if [[ $topgrade_exit -ne 0 ]]; then
+                    echo -e "\n${yellow}Warning: Topgrade finished with exit code $topgrade_exit (some secondary updates may have been skipped).${reset}"
+                fi
             else
                 echo -e "\n${yellow}$tool_name was cancelled or did not fully apply updates.${reset}"
                 echo -ne "${white}Run topgrade anyway? (Flatpaks/AUR etc) [y/N]: ${reset}"
                 read -r force_extra
                 if [[ "$force_extra" =~ ^[Yy]$ ]]; then
-                    execute_update_task "topgrade" && UPDATE_SUCCESS=true
+                    execute_update_task "topgrade"
+                    topgrade_exit=$?
+                    if [[ $topgrade_exit -eq 0 ]] || [[ -z "$(check_pending_updates "repo_only")" ]]; then
+                        UPDATE_SUCCESS=true
+                        if [[ $topgrade_exit -ne 0 ]]; then
+                            echo -e "\n${yellow}Warning: Topgrade exited with code $topgrade_exit, but core system updates were successfully applied.${reset}"
+                        fi
+                    else
+                        echo -e "\n${red}Topgrade failed with exit code $topgrade_exit.${reset}"
+                    fi
                 else
                     echo -e "${dim}Skipping extra updates.${reset}\n"
                 fi
@@ -2263,7 +2282,16 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
         elif [[ "$HAS_TOPGRADE" == "true" ]]; then
             echo -e "${blue}${bold}Running Topgrade (System, AUR, Firmware, etc.)...${reset}\n"
-            execute_update_task "topgrade" && UPDATE_SUCCESS=true
+            execute_update_task "topgrade"
+            topgrade_exit=$?
+            if [[ $topgrade_exit -eq 0 ]] || [[ -z "$(check_pending_updates "repo_only")" ]]; then
+                UPDATE_SUCCESS=true
+                if [[ $topgrade_exit -ne 0 ]]; then
+                    echo -e "\n${yellow}Warning: Topgrade exited with code $topgrade_exit, but core system updates were successfully applied.${reset}"
+                fi
+            else
+                echo -e "\n${red}Topgrade failed with exit code $topgrade_exit.${reset}"
+            fi
 
         else
             echo -e "${blue}${bold}Running standard system update...${reset}\n"
