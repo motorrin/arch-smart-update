@@ -15,7 +15,7 @@
 
 </div>
 
-**arch_smart_update** is a bash wrapper designed to safeguard system updates on vanilla **Arch Linux** and its derivatives. Instead of updating blindly, it gives you complete control over the upgrade process by presenting **package build dates**, **package descriptions**, official **Arch news** alerts, and stability recommendations from an intelligent **Update Advisor** — enabling you to make an informed decision before delegating the actual transactions directly to **pacman**, an **AUR helper**, or **topgrade**.
+**arch-smart-update** is a bash wrapper designed to safeguard system updates on vanilla **Arch Linux** and its derivatives. Instead of updating blindly, it gives you complete control over the upgrade process by presenting **package build dates**, **package descriptions**, official **Arch news** alerts, and stability recommendations from an intelligent **Update Advisor** — enabling you to make an informed decision before delegating the actual transactions directly to **pacman**, an **AUR helper**, or **topgrade**.
 
 The script also supports distribution-specific utilities on **EndeavourOS** (such as `eos-update`) and **CachyOS** (such as `arch-update`), while remaining fully compatible with any other Arch-based system.
 
@@ -116,7 +116,7 @@ For paru:
 If you choose to install the script manually, keep in mind that you will also have to manually download new versions to ensure stability:
 
 1. `cd ~`  
-2. `curl -O https://raw.githubusercontent.com/motorrin/arch_smart_update/main/arch-smart-update.sh`  
+2. `curl -O https://raw.githubusercontent.com/motorrin/arch-smart-update/main/arch-smart-update.sh`  
 3. `chmod +x arch-smart-update.sh`
 
 ## ❓ How do I use this script?
