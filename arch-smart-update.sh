@@ -321,7 +321,7 @@ if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
         fi
 
         case "$key" in
-            AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP)
+            AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP|SILENCE_UPDATES)
                 declare -g "$key=$val" ;;
         esac
     done < "$SETTINGS_CONF"
@@ -356,6 +356,7 @@ fi
 : "${T_DE_H:=12}"
 : "${T_NUKE_H:=24}"
 : "${IGNORE_PATCH_TIMERS:=true}"
+: "${SILENCE_UPDATES:=6h}"
 
 declare -A NUKE_MAP
 for pkg in "${NUCLEAR_PKGS[@]}"; do NUKE_MAP["$pkg"]=1; done
@@ -547,7 +548,7 @@ if [[ "$DAEMON_MODE" == true ]]; then
     fi
 
     NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
-    if [[ -f "$NEXT_CHECK_FILE" ]]; then
+    if [[ "$1" == "--daemon" ]] && [[ -f "$NEXT_CHECK_FILE" ]]; then
         NEXT_TS=$(cat "$NEXT_CHECK_FILE" 2>/dev/null)
         NOW_TS=$(date +%s)
         if [[ "$NEXT_TS" =~ ^[0-9]+$ ]] && (( NEXT_TS > NOW_TS + 300 )); then
@@ -799,6 +800,8 @@ except Exception:
                         if notify-send --help 2>&1 | grep -q -- "--action"; then
                             local TMP_NEWS
                             TMP_NEWS=$(mktemp --suffix=.sh "${XDG_RUNTIME_DIR:-/tmp}/asu_news.XXXXXX")
+                            local news_notif_icon="dialog-warning"
+                            [[ -f "$ICON_PATH" ]] && news_notif_icon="$ICON_PATH"
                             cat <<EOF > "$TMP_NEWS"
 #!/bin/bash
 trap 'rm -f "\$0"' EXIT
@@ -821,22 +824,19 @@ if [[ "\$notif_daemon" =~ (mako|dunst|lxqt|xfce|fnott|wired) ]] || [[ "\$desktop
     use_single_action=true
 fi
 
-is_xfce_lxqt=false
-if [[ "\$notif_daemon" == *"xfce"* || "\$notif_daemon" == *"lxqt"* || "\$desktop_env" == *"xfce"* || "\$desktop_env" == *"lxqt"* ]]; then
-    is_xfce_lxqt=true
-fi
+notif_icon="${news_notif_icon}"
 
 if [[ "\$use_single_action" == "true" ]]; then
-    action=\$(notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" --action="default=Read News" --action="silence=Silence" "Attention: Arch News detected!" "Published $diff_hours h. ago.\nCheck archlinux.org before updating.")
+    action=\$(notify-send -a "Arch Smart Update" -u critical -i "\$notif_icon" --action="default=Read News" --action="silence=Silence" "Attention: Arch News detected!" "Published $diff_hours h. ago.\nCheck archlinux.org before updating.")
 else
-    action=\$(notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" --action="default=Read News" --action="read=Read News" --action="silence=Silence" "Attention: Arch News detected!" "Published $diff_hours h. ago.\nCheck archlinux.org before updating.")
+    action=\$(notify-send -a "Arch Smart Update" -u critical -i "\$notif_icon" --action="default=Read News" --action="read=Read News" --action="silence=Silence" "Attention: Arch News detected!" "Published $diff_hours h. ago.\nCheck archlinux.org before updating.")
 fi
 
 action_clean=\$(echo "\$action" | tr -d ' \n\r')
 
-if [[ "\$action_clean" == "silence" || ( "\$is_xfce_lxqt" == "true" && "\$action_clean" == "1" ) || ( "\$is_xfce_lxqt" != "true" && "\$action_clean" == "2" ) ]]; then
+if [[ "\$action_clean" == "silence" || ( "\$use_single_action" == "true" && "\$action_clean" == "1" ) || ( "\$use_single_action" == "false" && "\$action_clean" == "2" ) ]]; then
     echo "${news_ts}|silenced" > "$NEWS_CACHE"
-elif [[ "\$action_clean" == "read" || "\$action_clean" == "default" || ( "\$is_xfce_lxqt" == "true" && "\$action_clean" == "0" ) || ( "\$is_xfce_lxqt" != "true" && ( "\$action_clean" == "0" || "\$action_clean" == "1" ) ) ]]; then
+elif [[ "\$action_clean" == "read" || "\$action_clean" == "default" || "\$action_clean" == "0" || ( "\$use_single_action" == "false" && "\$action_clean" == "1" ) ]]; then
     echo "${news_ts}|silenced" > "$NEWS_CACHE"
 
     open_url() {
@@ -937,6 +937,72 @@ execute_update_task() {
     fi
 
     /bin/bash -c "$cmd"
+}
+
+check_reboot_needed() {
+    local critical_pkgs="^(linux|nvidia|systemd|wayland|dbus|mesa)(-[a-z0-9-]+)?$|ucode$"
+    local log_file
+    log_file=$(pacman-conf LogFile 2>/dev/null)
+    : "${log_file:=/var/log/pacman.log}"
+    
+    if [[ ! -r "$log_file" ]] && ! sudo test -r "$log_file" 2>/dev/null; then
+        return 0
+    fi
+    
+    local boot_time
+    boot_time=$(uptime -s 2>/dev/null)
+    [[ -z "$boot_time" ]] && return 0
+    local boot_ts
+    boot_ts=$(date -d "$boot_time" +%s 2>/dev/null)
+    [[ -z "$boot_ts" ]] && return 0
+    
+    local read_cmd=(tail -n 2000 "$log_file")
+    if [[ ! -r "$log_file" ]]; then
+        read_cmd=(sudo tail -n 2000 "$log_file")
+    fi
+    
+    local updated_pkgs
+    updated_pkgs=$("${read_cmd[@]}" 2>/dev/null | awk -v boot_ts="$boot_ts" -v crit="$critical_pkgs" '
+        / upgraded | installed | downgraded / {
+            idx1 = index($0, "[")
+            idx2 = index($0, "]")
+            if (idx1 == 1 && idx2 > idx1) {
+                ts_str = substr($0, idx1 + 1, idx2 - idx1 - 1)
+                gsub(/[-T:+]/, " ", ts_str)
+                split(ts_str, d, " ")
+                if (!d[6]) d[6] = "00"
+                spec = sprintf("%04d %02d %02d %02d %02d %02d", d[1], d[2], d[3], d[4], d[5], d[6])
+                epoch = mktime(spec)
+                if (epoch > boot_ts) {
+                    pkg_name = ""
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "upgraded" || $i == "installed" || $i == "downgraded") {
+                            pkg_name = $(i + 1)
+                            break
+                        }
+                    }
+                    if (pkg_name != "" && pkg_name ~ crit) {
+                        pkgs[pkg_name] = 1
+                    }
+                }
+            }
+        }
+        END {
+            out = ""
+            for (p in pkgs) {
+                out = out p " "
+            }
+            if (out != "") {
+                sub(/ $/, "", out)
+                print out
+            }
+        }
+    ')
+    if [[ -n "$updated_pkgs" ]]; then
+        echo -e "\n${yellow}${bold}System reboot recommended!${reset}"
+        echo -e "${dim}The following critical components were upgraded during this session:${reset}"
+        echo -e "${white}$updated_pkgs${reset}\n"
+    fi
 }
 
 # --- 5. Mirror Refresh Function ---
@@ -1994,11 +2060,17 @@ if [[ "$DAEMON_MODE" == true ]]; then
 
             if notify-send --help 2>&1 | grep -q -- "--action"; then
                 TMP_NOTIFY=$(mktemp --suffix=.sh "${XDG_RUNTIME_DIR:-/tmp}/asu_update.XXXXXX")
+                terminal_esc=$(printf '%q' "${TERMINAL:-}")
+                config_dir_esc=$(printf '%q' "${CONFIG_DIR}")
+                silence_updates_esc=$(printf '%q' "${SILENCE_UPDATES}")
+                script_bin_esc=$(printf '%q' "${SCRIPT_BIN:-$(realpath "$(command -v "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")")}")
+                main_notif_icon="software-update-available"
+                [[ -f "$ICON_PATH" ]] && main_notif_icon="$ICON_PATH"
                 cat <<EOF > "$TMP_NOTIFY"
 #!/bin/bash
 trap 'rm -f "\$0"' EXIT
-export TERMINAL="${TERMINAL:-}"
-export SCRIPT_BIN="${SCRIPT_BIN:-$(realpath "$(command -v "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")")}"
+export TERMINAL=${terminal_esc}
+export SCRIPT_BIN=${script_bin_esc}
 export DISPLAY="${DISPLAY:-}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}"
 export XAUTHORITY="${XAUTHORITY:-}"
@@ -2008,6 +2080,8 @@ export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}"
 export XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export XDG_CONFIG_DIRS="${XDG_CONFIG_DIRS:-/etc/xdg}"
 export PATH="\$PATH:/usr/local/bin:/usr/bin:/bin"
+export CONFIG_DIR=${config_dir_esc}
+export SILENCE_UPDATES=${silence_updates_esc}
 
 notif_daemon=\$(dbus-send --session --print-reply --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.GetServerInformation 2>/dev/null | awk -F'"' '/string/ {print \$2; exit}')
 notif_daemon=\${notif_daemon,,}
@@ -2018,15 +2092,36 @@ if [[ "\$notif_daemon" =~ (mako|dunst|lxqt|xfce|fnott|wired) ]] || [[ "\$desktop
     use_single_action=true
 fi
 
+notif_icon="${main_notif_icon}"
+
 if [[ "\$use_single_action" == "true" ]]; then
-    action=\$(notify-send -a "Arch Smart Update" -u normal -i "$notif_icon" --action="default=Update Now" "Safe Updates Available" "Found $pkg_count updates ($aur_count AUR).\nReady to install.")
+    action=\$(notify-send -a "Arch Smart Update" -u normal -i "\$notif_icon" --action="default=Update Now" --action="silence=Silence" "Safe Updates Available" "Found $pkg_count updates ($aur_count AUR).\nReady to install.")
 else
-    action=\$(notify-send -a "Arch Smart Update" -u normal -i "$notif_icon" --action="default=Update Now" --action="update=Update Now" "Safe Updates Available" "Found $pkg_count updates ($aur_count AUR).\nReady to install.")
+    action=\$(notify-send -a "Arch Smart Update" -u normal -i "\$notif_icon" --action="default=Update Now" --action="update=Update Now" --action="silence=Silence" "Safe Updates Available" "Found $pkg_count updates ($aur_count AUR).\nReady to install.")
 fi
 
 action_clean=\$(echo "\$action" | tr -d ' \n\r')
 
-if [[ "\$action_clean" == "update" || "\$action_clean" == "default" || "\$action_clean" == "0" || "\$action_clean" == "1" || "\$action_clean" == "2" ]]; then
+if [[ "\$action_clean" == "silence" || ( "\$use_single_action" == "true" && "\$action_clean" == "1" ) || ( "\$use_single_action" == "false" && "\$action_clean" == "2" ) ]]; then
+    rm -f "\$0"
+    silence_sec=21600
+    if [[ "\$SILENCE_UPDATES" =~ ^([0-9]+)\$ ]]; then
+        silence_sec=\$(( BASH_REMATCH[1] * 3600 ))
+    elif [[ "\$SILENCE_UPDATES" =~ ^([0-9]+)[[:space:]]*([a-zA-Z]+)\$ ]]; then
+        num="\${BASH_REMATCH[1]}"
+        unit="\${BASH_REMATCH[2],,}"
+        case "\$unit" in
+            s|sec|secs|second|seconds) silence_sec="\$num" ;;
+            m|min|mins|minute|minutes) silence_sec=\$(( num * 60 )) ;;
+            h|hr|hrs|hour|hours) silence_sec=\$(( num * 3600 )) ;;
+            d|day|days) silence_sec=\$(( num * 86400 )) ;;
+            w|wk|wks|week|weeks) silence_sec=\$(( num * 604800 )) ;;
+        esac
+    fi
+    silence_ts=\$(( \$(date +%s) + silence_sec ))
+    echo "\$silence_ts" > "\${CONFIG_DIR}/next_check.conf"
+    exit 0
+elif [[ "\$action_clean" == "update" || "\$action_clean" == "default" || "\$action_clean" == "0" || ( "\$use_single_action" == "false" && "\$action_clean" == "1" ) ]]; then
     rm -f "\$0"
     if [[ -n "\$TERMINAL" ]] && command -v "\$TERMINAL" >/dev/null 2>&1; then
         exec "\$TERMINAL" -e "\$SCRIPT_BIN"
@@ -2377,12 +2472,21 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         else
             echo ""
         fi
+        check_reboot_needed
     else
         echo -e "\n${red}Update process completed with errors, partial updates, or was cancelled.${reset}\n"
     fi
 
 else
     echo -e "${yellow}Operation cancelled.${reset}\n"
+fi
+
+if [[ "$DAEMON_MODE" == "false" ]] && [ -t 0 ]; then
+    if [[ "${GENERATE_LOGS,,}" == "true" && -n "${LOG_FILE:-}" ]]; then
+        echo -e "${green}Log was written to ${white}$LOG_FILE${reset}"
+    fi
+    echo -ne "${gray}Press Enter to finish update.${reset}"
+    read -r </dev/tty 2>/dev/null || read -r
 fi
 
 sleep 0.1
