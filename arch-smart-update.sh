@@ -785,7 +785,7 @@ except Exception:
         now_time=$(date +%s)
         diff_hours=$(( (now_time - news_ts) / 3600 ))
 
-        if (( diff_hours < 999999 )); then
+        if (( diff_hours < 336 )); then
             local NEWS_CACHE="$CONFIG_DIR/news.cache"
             local OLD_NEWS_TS=0
             local NEWS_SILENCED=false
