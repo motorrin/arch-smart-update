@@ -28,6 +28,7 @@ if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     echo -e "  ${cyan}(no arguments)${reset}  Run this to manually inspect pending updates in a detailed layout and choose when to install them."
     echo -e "  ${cyan}--daemon${reset}        Run this in the background to automatically monitor updates and receive a desktop notification when they are ready."
     echo -e "  ${cyan}--check${reset}         Run a single, quiet scan right now to check for updates and test your notification settings without keeping a service running."
+    echo -e "  ${cyan}--reconfigure${reset}   Remove the current settings.conf to trigger a fresh setup on the next launch."
     echo -e "  ${cyan}--help, -h${reset}      Display this help screen showing all available options."
     exit 0
 fi
@@ -39,31 +40,10 @@ fi
 
 exec {ASU_TTY_OUT}>&1 {ASU_TTY_ERR}>&2
 
-log_step() {
-    echo -e "${dim}[$(date +%T)] $1${reset}"
-}
-
-for cmd in python3 tar awk stat curl zstd; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
-        echo -e "${red}Error: Required command '$cmd' is not installed.${reset}"
-        exit 1
-    fi
-done
-
 DAEMON_MODE=false
 if [[ "$1" == "--daemon" || "$1" == "--check" ]]; then
     DAEMON_MODE=true
 fi
-
-prompt_user() {
-    local msg="$1" options="$2" var_name="$3"
-    local user_input=""
-    if ! $DAEMON_MODE; then
-        echo -ne "${white}${msg} [${options}]: ${reset}"
-        read -r user_input </dev/tty
-    fi
-    [[ -n "$user_input" ]] && declare -g "$var_name=$user_input"
-}
 
 # --- 2. Configuration & External Files ---
 USER_HOME=$HOME
@@ -86,6 +66,54 @@ SETTINGS_DEFAULT="$CONFIG_DIR/settings.default.conf"
 SETTINGS_CONF="$CONFIG_DIR/settings.conf"
 DAEMON_TEMPLATE="$CONFIG_DIR/daemon.template"
 ICON_PATH="$CONFIG_DIR/ASU.png"
+
+if [[ "$1" == "--reconfigure" ]]; then
+    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
+    removed_any=false
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" || -f "$SYSTEMD_USER_DIR/arch-smart-update.service" ]]; then
+            systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
+            rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
+            systemctl --user daemon-reload >/dev/null 2>&1
+            removed_any=true
+        fi
+    fi
+
+    if [[ -f "$SETTINGS_CONF" ]]; then
+        rm -f "$SETTINGS_CONF"
+        echo -e "${green}Configuration file settings.conf has been removed.${reset}"
+        removed_any=true
+    fi
+
+    if [[ "$removed_any" == "true" ]]; then
+        echo -e "${yellow}Please run the script again to initiate the configuration setup.${reset}"
+    else
+        echo -e "${yellow}No active configuration or background service found to remove.${reset}"
+    fi
+    exit 0
+fi
+
+log_step() {
+    echo -e "${dim}[$(date +%T)] $1${reset}"
+}
+
+for cmd in python3 tar awk stat curl zstd; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo -e "${red}Error: Required command '$cmd' is not installed.${reset}"
+        exit 1
+    fi
+done
+
+prompt_user() {
+    local msg="$1" options="$2" var_name="$3"
+    local user_input=""
+    if ! $DAEMON_MODE; then
+        echo -ne "${white}${msg} [${options}]: ${reset}"
+        read -r user_input </dev/tty
+    fi
+    [[ -n "$user_input" ]] && declare -g "$var_name=$user_input"
+}
 
 update_from_github() {
     local file_path="$1"
@@ -284,6 +312,21 @@ fi
 if ! validate_user_conf "$PKG_CONF" "packages.conf"; then
     echo -e "${yellow}Packages config disabled due to security check failure.${reset}"
     PKG_CONF=""
+fi
+
+if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
+    has_new_features=false
+    while read -r key; do
+        if [[ -n "$key" ]] && ! grep -qE "^[[:space:]]*(#)?[[:space:]]*${key}[[:space:]]*(\+)?=" "$SETTINGS_CONF"; then
+            has_new_features=true
+            break
+        fi
+    done < <(grep -E '^[A-Za-z0-9_]+[[:space:]]*(\+)?=' "$SETTINGS_DEFAULT" | cut -d= -f1 | sed -E 's/\+//g; s/[[:space:]]+$//' | tr -d '\r')
+
+    if [[ "$has_new_features" == "true" && "$DAEMON_MODE" == "false" ]]; then
+        echo -e "${yellow}Notice: Your settings.conf may be missing newer configuration options present in settings.default.conf.${reset}"
+        echo -e "${dim}It is recommended to run this script with ${white}--reconfigure${dim} to regenerate your settings and configure new options.${reset}\n"
+    fi
 fi
 
 NUCLEAR_PKGS=("glibc" "linux" "systemd" "pacman" "nvidia" "mkinitcpio")
@@ -2123,6 +2166,7 @@ if [[ "\$action_clean" == "silence" || ( "\$use_single_action" == "true" && "\$a
     exit 0
 elif [[ "\$action_clean" == "update" || "\$action_clean" == "default" || "\$action_clean" == "0" || ( "\$use_single_action" == "false" && "\$action_clean" == "1" ) ]]; then
     rm -f "\$0"
+    export ASU_SPAWNED=true
     if [[ -n "\$TERMINAL" ]] && command -v "\$TERMINAL" >/dev/null 2>&1; then
         exec "\$TERMINAL" -e "\$SCRIPT_BIN"
     elif command -v xdg-terminal-exec >/dev/null 2>&1; then
@@ -2485,8 +2529,26 @@ if [[ "$DAEMON_MODE" == "false" ]] && [ -t 0 ]; then
     if [[ "${GENERATE_LOGS,,}" == "true" && -n "${LOG_FILE:-}" ]]; then
         echo -e "${green}Log was written to ${white}$LOG_FILE${reset}"
     fi
-    echo -ne "${gray}Press Enter to finish update.${reset}"
+    echo -ne "${gray}Press Enter to close terminal.${reset}"
     read -r </dev/tty 2>/dev/null || read -r
+    trap - EXIT INT TERM
+    cleanup
+    if [[ "${ASU_SPAWNED:-}" == "true" ]] && [[ "$PPID" -gt 1 ]]; then
+        parent_comm=""
+        if [[ -r "/proc/$PPID/comm" ]]; then
+            parent_comm=$(cat "/proc/$PPID/comm" 2>/dev/null)
+        fi
+        if [[ -z "$parent_comm" ]]; then
+            parent_comm=$(ps -p "$PPID" -o comm= 2>/dev/null)
+        fi
+        parent_comm=$(echo "${parent_comm,,}" | tr -d '[:space:]')
+        case "$parent_comm" in
+            bash|zsh|fish|sh|ksh|dash|tcsh|csh)
+                trap '' HUP
+                kill -HUP "$PPID" 2>/dev/null
+                ;;
+        esac
+    fi
 fi
 
 sleep 0.1
