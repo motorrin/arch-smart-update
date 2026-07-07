@@ -28,7 +28,7 @@ The script also supports distribution-specific utilities on **EndeavourOS** (suc
 
 ## Daemon preview (optional, can be activated on first launch)
 
-![03](https://github.com/user-attachments/assets/b6e3e434-023f-468a-858e-9d0c7290fb40)
+![03](https://github.com/user-attachments/assets/a4c8fbbb-3195-4ece-9bab-d82b6e56fea4)
 
 ---
 
@@ -82,9 +82,7 @@ To ensure your personal settings are never overwritten by script updates, the co
   - **Overrides:** Define a `CUSTOM_REFLECTOR_CMD` or define `CUSTOM_CMDS` (e.g., `flatpak update -y`) to run instead of the standard utilities.
   - **User Packages:** Add your own apps to the arrays (e.g., `USER_CRITICAL_PKGS=("my-important-app")`) to integrate them into the Advisor's threat levels.
 
-*(Note: If you are upgrading from a pre-3.0 version, the script features an automated migration tool that will seamlessly merge your old fragmented files into the new `settings.conf` on its first run).*
-
-Whenever the master configuration on GitHub is updated, the script will quietly pull the changes without touching your custom files!
+Whenever the master configuration on GitHub is updated, the script will quietly pull the changes without touching your custom files. If new features or options are introduced to `settings.default.conf` that are missing in your active `settings.conf`, the script will display a notice. You can easily regenerate your configuration to access new settings by running the script with the `--reconfigure` flag.
 
 ## 📋 Dependencies
 
