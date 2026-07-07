@@ -785,7 +785,7 @@ except Exception:
         now_time=$(date +%s)
         diff_hours=$(( (now_time - news_ts) / 3600 ))
 
-        if (( diff_hours < 336 )); then
+        if (( diff_hours < 999999 )); then
             local NEWS_CACHE="$CONFIG_DIR/news.cache"
             local OLD_NEWS_TS=0
             local NEWS_SILENCED=false
@@ -2529,7 +2529,13 @@ if [[ "$DAEMON_MODE" == "false" ]] && [ -t 0 ]; then
     if [[ "${GENERATE_LOGS,,}" == "true" && -n "${LOG_FILE:-}" ]]; then
         echo -e "${green}Log was written to ${white}$LOG_FILE${reset}"
     fi
-    echo -ne "${gray}Press Enter to close terminal.${reset}"
+
+    if [[ "${ASU_SPAWNED:-}" == "true" ]]; then
+        echo -ne "${gray}Press Enter to close terminal.${reset}"
+    else
+        echo -ne "${gray}Press Enter to finish update.${reset}"
+    fi
+
     read -r </dev/tty 2>/dev/null || read -r
     trap - EXIT INT TERM
     cleanup
