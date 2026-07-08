@@ -179,7 +179,7 @@ if [[ "$1" == "--reconfigure" ]]; then
         if [[ ! -f "$SETTINGS_DEFAULT" ]]; then
             echo -e "${yellow}Local settings.default.conf not found. Attempting template download...${reset}"
             if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
-                update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/Arch_Smart_Update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
+                update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
             fi
         fi
 
@@ -555,10 +555,10 @@ fi
 echo -e "${dim}Checking for configuration updates...${reset}"
 
 if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
-    update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/Arch_Smart_Update/main/packages.conf" "NUCLEAR_PKGS"
-    update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/Arch_Smart_Update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
-    update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/Arch_Smart_Update/main/daemon.template" "[TimerTemplate]"
-    update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/Arch_Smart_Update/main/ASU.png" ""
+    update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/packages.conf" "NUCLEAR_PKGS"
+    update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
+    update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/daemon.template" "[TimerTemplate]"
+    update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/ASU.png" ""
 else
     echo -e "${dim}GitHub is unreachable. Skipping configuration updates...${reset}"
 fi
