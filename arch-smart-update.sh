@@ -28,7 +28,7 @@ if [[ "$1" == "--help" || "$1" == "-h" ]]; then
     echo -e "  ${cyan}(no arguments)${reset}  Run this to manually inspect pending updates in a detailed layout and choose when to install them."
     echo -e "  ${cyan}--daemon${reset}        Run this in the background to automatically monitor updates and receive a desktop notification when they are ready."
     echo -e "  ${cyan}--check${reset}         Run a single, quiet scan right now to check for updates and test your notification settings without keeping a service running."
-    echo -e "  ${cyan}--reconfigure${reset}   Remove the current settings.conf to trigger a fresh setup on the next launch."
+    echo -e "  ${cyan}--reconfigure${reset}   Align and update settings.conf with new default options while preserving custom settings."
     echo -e "  ${cyan}--help, -h${reset}      Display this help screen showing all available options."
     exit 0
 fi
@@ -59,40 +59,42 @@ if ! $DAEMON_MODE && [ -d "$CONFIG_DIR" ]; then
     fi
 fi
 
-mkdir -p "$CONFIG_DIR"
-
 PKG_CONF="$CONFIG_DIR/packages.conf"
 SETTINGS_DEFAULT="$CONFIG_DIR/settings.default.conf"
 SETTINGS_CONF="$CONFIG_DIR/settings.conf"
 DAEMON_TEMPLATE="$CONFIG_DIR/daemon.template"
 ICON_PATH="$CONFIG_DIR/ASU.png"
 
-if [[ "$1" == "--reconfigure" ]]; then
-    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
-    removed_any=false
+OUTPUT_FILE=""
+SYNC_LOG=""
+REFL_LOG=""
+CHECK_DB=""
+SUDO_KEEP_ALIVE_PID=""
 
-    if command -v systemctl >/dev/null 2>&1; then
-        if [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" || -f "$SYSTEMD_USER_DIR/arch-smart-update.service" ]]; then
-            systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
-            rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
-            systemctl --user daemon-reload >/dev/null 2>&1
-            removed_any=true
+cleanup() {
+    if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill -0 "$SUDO_KEEP_ALIVE_PID" 2>/dev/null; then
+        kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null
+    fi
+
+    if [[ -n "$CHECK_DB" && -d "$CHECK_DB" && "$CHECK_DB" == /tmp/* && "$CHECK_DB" != "/tmp/" ]]; then
+        rm -rf -- "$CHECK_DB" 2>/dev/null
+        if [[ -d "$CHECK_DB" ]]; then
+            sudo rm -rf -- "$CHECK_DB" 2>/dev/null
         fi
     fi
 
-    if [[ -f "$SETTINGS_CONF" ]]; then
-        rm -f "$SETTINGS_CONF"
-        echo -e "${green}Configuration file settings.conf has been removed.${reset}"
-        removed_any=true
-    fi
+    local files_to_remove=()
+    [[ -f "$OUTPUT_FILE" ]] && files_to_remove+=("$OUTPUT_FILE")
+    [[ -f "$SYNC_LOG" ]] && files_to_remove+=("$SYNC_LOG")
+    [[ -f "$REFL_LOG" ]] && files_to_remove+=("$REFL_LOG")
+    [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF.tmp" ]] && files_to_remove+=("$SETTINGS_CONF.tmp")
 
-    if [[ "$removed_any" == "true" ]]; then
-        echo -e "${yellow}Please run the script again to initiate the configuration setup.${reset}"
-    else
-        echo -e "${yellow}No active configuration or background service found to remove.${reset}"
+    if [[ ${#files_to_remove[@]} -gt 0 ]]; then
+        rm -f "${files_to_remove[@]}"
     fi
-    exit 0
-fi
+}
+
+trap cleanup EXIT INT TERM
 
 log_step() {
     echo -e "${dim}[$(date +%T)] $1${reset}"
@@ -159,6 +161,321 @@ update_from_github() {
         rm -f "$tmp_file"
     fi
 }
+
+if [[ "$1" == "--reconfigure" ]]; then
+    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
+    removed_any=false
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" || -f "$SYSTEMD_USER_DIR/arch-smart-update.service" ]]; then
+            systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
+            rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
+            systemctl --user daemon-reload >/dev/null 2>&1
+            removed_any=true
+        fi
+    fi
+
+    if [[ -f "$SETTINGS_CONF" ]]; then
+        if [[ ! -f "$SETTINGS_DEFAULT" ]]; then
+            echo -e "${yellow}Local settings.default.conf not found. Attempting template download...${reset}"
+            if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
+                update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/Arch_Smart_Update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
+            fi
+        fi
+
+        if [[ -f "$SETTINGS_DEFAULT" ]]; then
+            python3 - "$SETTINGS_CONF" "$SETTINGS_DEFAULT" "$SETTINGS_CONF.tmp" <<'EOF'
+import re, sys, os
+
+def strip_quotes_preserve_length(s):
+    chars = list(s)
+    in_dquote = False
+    in_squote = False
+    escaped = False
+    for i, char in enumerate(chars):
+        if escaped:
+            chars[i] = ' '
+            escaped = False
+            continue
+        if char == '\\':
+            chars[i] = ' '
+            escaped = True
+            continue
+        if char == '"' and not in_squote:
+            in_dquote = not in_dquote
+            chars[i] = ' '
+        elif char == "'" and not in_dquote:
+            in_squote = not in_squote
+            chars[i] = ' '
+        elif in_dquote or in_squote:
+            chars[i] = ' '
+    return "".join(chars)
+
+def clean_comment_and_quotes(s):
+    clean = ""
+    in_dquote = False
+    in_squote = False
+    escaped = False
+    for char in s:
+        if escaped:
+            clean += char
+            escaped = False
+            continue
+        if char == '\\':
+            clean += char
+            escaped = True
+            continue
+        if char == '"' and not in_squote:
+            in_dquote = not in_dquote
+        elif char == "'" and not in_dquote:
+            in_squote = not in_squote
+        elif char == '#' and not in_dquote and not in_squote:
+            break
+        clean += char
+    clean = clean.strip()
+    return clean, strip_quotes_preserve_length(clean)
+
+def parse(content):
+    sc = {}
+    ar = {}
+    raw_lines = content.splitlines()
+    lines = []
+    accumulator = ""
+    for r_line in raw_lines:
+        r_stripped = r_line.rstrip()
+        if r_stripped.endswith("\\"):
+            accumulator += r_stripped[:-1]
+        else:
+            accumulator += r_line
+            lines.append(accumulator)
+            accumulator = ""
+    if accumulator:
+        lines.append(accumulator)
+        
+    in_array = False
+    current_array_name = None
+    current_array_elems = []
+    elem_re = re.compile(r'("[^"\\]*(?:\\.[^"\\]*)*")|(\'[^\'\\]*(?:\\.[^\'\\]*)*\')|([^\s\(\)]+)')
+
+    for line in lines:
+        line_stripped = line.strip()
+        if in_array:
+            clean_line, temp = clean_comment_and_quotes(line_stripped)
+            if ')' in temp:
+                idx_in_clean = temp.find(')')
+                last_part = clean_line[:idx_in_clean].strip()
+                if last_part:
+                    if last_part.startswith("#"):
+                        current_array_elems.append(last_part)
+                    else:
+                        for m in elem_re.finditer(last_part):
+                            item = m.group(1) or m.group(2) or m.group(3)
+                            if item is not None:
+                                current_array_elems.append(item)
+                ar[current_array_name] = current_array_elems
+                in_array = False
+                current_array_name = None
+                current_array_elems = []
+            else:
+                if line_stripped:
+                    if line_stripped.startswith("#"):
+                        current_array_elems.append(line_stripped)
+                    else:
+                        for m in elem_re.finditer(clean_line):
+                            item = m.group(1) or m.group(2) or m.group(3)
+                            if item is not None:
+                                current_array_elems.append(item)
+        else:
+            if not line_stripped or line_stripped.startswith("#"):
+                continue
+
+            clean_line, temp = clean_comment_and_quotes(line_stripped)
+            if not clean_line:
+                continue
+
+            m_arr = re.match(r"^([A-Za-z0-9_]+)\s*(\+)?=\s*\((.*)", clean_line)
+            if m_arr:
+                name = m_arr.group(1)
+                rest = m_arr.group(3).strip()
+                in_array = True
+                current_array_name = name
+                current_array_elems = []
+
+                temp = strip_quotes_preserve_length(rest)
+                if ')' in temp:
+                    idx = temp.find(')')
+                    rest_clean = rest[:idx].strip()
+                    if rest_clean:
+                        if rest_clean.startswith("#"):
+                            current_array_elems.append(rest_clean)
+                        else:
+                            for m in elem_re.finditer(rest_clean):
+                                item = m.group(1) or m.group(2) or m.group(3)
+                                if item is not None:
+                                    current_array_elems.append(item)
+                    ar[name] = current_array_elems
+                    in_array = False
+                    current_array_name = None
+                    current_array_elems = []
+            else:
+                if "=" in clean_line:
+                    parts = clean_line.split("=", 1)
+                    k = parts[0].strip()
+                    if k.endswith("+"):
+                        k = k[:-1].strip()
+                    if re.match(r"^[A-Za-z0-9_]+$", k):
+                        sc[k] = parts[1].strip()
+    return sc, ar
+
+u_sc, u_ar = {}, {}
+if os.path.exists(sys.argv[1]):
+    try:
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            u_sc, u_ar = parse(f.read())
+    except Exception as e:
+        print(f"Error parsing user configuration file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+try:
+    with open(sys.argv[2], "r", encoding="utf-8") as f:
+        t_content = f.read()
+        t_lines = t_content.splitlines(keepends=True)
+        t_sc, t_ar = parse(t_content)
+except Exception as e:
+    print(f"Error reading configuration template: {e}", file=sys.stderr)
+    sys.exit(1)
+
+out = []
+in_arr = False
+arr_name = None
+migrated_scalars = set()
+migrated_arrays = set()
+
+is_tty = sys.stdout.isatty()
+BLUE = "\033[38;5;75m" if is_tty else ""
+GREEN = "\033[38;5;71m" if is_tty else ""
+YELLOW = "\033[38;5;214m" if is_tty else ""
+RED = "\033[38;5;196m" if is_tty else ""
+MAGENTA = "\033[38;5;176m" if is_tty else ""
+CYAN = "\033[38;5;79m" if is_tty else ""
+GRAY = "\033[38;5;244m" if is_tty else ""
+DIM = "\033[2m" if is_tty else ""
+BOLD = "\033[1m" if is_tty else ""
+RESET = "\033[0m" if is_tty else ""
+
+print(f"{BLUE}{BOLD}:: Commencing smart configuration migration...{RESET}")
+
+for line_raw in t_lines:
+    line = line_raw.strip()
+    if in_arr:
+        clean_line, temp = clean_comment_and_quotes(line)
+        if ")" in temp:
+            el = u_ar.get(arr_name)
+            if el is not None:
+                if el:
+                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    for item in el:
+                        out.append(f"    {item}\n")
+                else:
+                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+            else:
+                default_el = t_ar.get(arr_name, [])
+                print(f"  {DIM}[Thinking]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+            out.append(line_raw)
+            in_arr = False
+        else:
+            if arr_name not in u_ar:
+                out.append(line_raw)
+        continue
+
+    m_arr = re.match(r"^([A-Za-z0-9_]+)\s*(\+)?=\s*\(", line)
+    if m_arr:
+        arr_name = m_arr.group(1)
+        out.append(line_raw)
+        migrated_arrays.add(arr_name)
+        clean_line, temp = clean_comment_and_quotes(line)
+        idx_paren = temp.find('(')
+        if idx_paren != -1 and ")" in temp[idx_paren+1:]:
+            el = u_ar.get(arr_name)
+            if el is not None:
+                out.pop()
+                out.append(f"{arr_name}=(\n")
+                if el:
+                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    for item in el:
+                        out.append(f"    {item}\n")
+                else:
+                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                out.append(")\n")
+            else:
+                default_el = t_ar.get(arr_name, [])
+                print(f"  {DIM}[Thinking]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+        else:
+            in_arr = True
+        continue
+
+    m_sc = re.match(r"^(\s*#\s*)?([A-Za-z0-9_]+)\s*(\+)?=\s*(.*)", line)
+    if m_sc:
+        k = m_sc.group(2)
+        migrated_scalars.add(k)
+        is_commented = m_sc.group(1) is not None and m_sc.group(1).strip().startswith("#")
+        if k in u_sc:
+            user_val = u_sc[k]
+            default_val = t_sc.get(k, "N/A")
+            if user_val != default_val:
+                print(f"  {DIM}[Thinking]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
+            else:
+                print(f"  {DIM}[Thinking]{RESET} Option {CYAN}{k:<23}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
+            out.append(f"{k}={user_val}\n")
+            continue
+        else:
+            if is_commented:
+                out.append(line_raw)
+                continue
+            else:
+                default_val = t_sc.get(k, "N/A")
+                print(f"  {DIM}[Thinking]{RESET} Option {MAGENTA}{k:<23}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
+                out.append(line_raw)
+                continue
+
+    out.append(line_raw)
+
+orphans = set(u_sc.keys()) - migrated_scalars
+orphan_arrays = set(u_ar.keys()) - migrated_arrays
+if orphans or orphan_arrays:
+    print(f"\n{YELLOW}{BOLD}:: Deprecated parameter cleanup:{RESET}")
+    for o in orphans:
+        print(f"  {DIM}[Thinking]{RESET} Option {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
+    for o in orphan_arrays:
+        print(f"  {DIM}[Thinking]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
+
+with open(sys.argv[3], "w", encoding="utf-8") as f:
+    f.writelines(out)
+EOF
+            if [[ $? -eq 0 && -f "$SETTINGS_CONF.tmp" ]]; then
+                mv "$SETTINGS_CONF.tmp" "$SETTINGS_CONF"
+                chmod 600 "$SETTINGS_CONF"
+                echo -e "\n${green}Smart configuration migration for settings.conf has completed successfully.${reset}"
+                removed_any=true
+            else
+                echo -e "${red}Error: Failed to process and merge configuration files.${reset}"
+                rm -f "$SETTINGS_CONF.tmp"
+                exit 1
+            fi
+        else
+            echo -e "${red}Critical: Default configuration template settings.default.conf is missing.${reset}"
+            echo -e "${yellow}Your existing configuration settings.conf has been left intact.${reset}"
+            exit 1
+        fi
+    fi
+
+    if [[ "$removed_any" == "true" ]]; then
+        echo -e "${yellow}Configuration re-alignment completed successfully.${reset}"
+    else
+        echo -e "${yellow}No active configuration or background service found to reset.${reset}"
+    fi
+    exit 0
+fi
 
 validate_user_conf() {
     local file="$1"
@@ -650,36 +967,6 @@ if [[ "${GENERATE_LOGS,,}" == "true" ]]; then
 fi
 
 # --- 3. Temporary Files ---
-OUTPUT_FILE=""
-SYNC_LOG=""
-REFL_LOG=""
-CHECK_DB=""
-
-# shellcheck disable=SC2329
-cleanup() {
-    if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill -0 "$SUDO_KEEP_ALIVE_PID" 2>/dev/null; then
-        kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null
-    fi
-
-    if [[ -n "$CHECK_DB" && -d "$CHECK_DB" && "$CHECK_DB" == /tmp/* && "$CHECK_DB" != "/tmp/" ]]; then
-        rm -rf -- "$CHECK_DB" 2>/dev/null
-        if [[ -d "$CHECK_DB" ]]; then
-            sudo rm -rf -- "$CHECK_DB" 2>/dev/null
-        fi
-    fi
-
-    local files_to_remove=()
-    [[ -f "$OUTPUT_FILE" ]] && files_to_remove+=("$OUTPUT_FILE")
-    [[ -f "$SYNC_LOG" ]] && files_to_remove+=("$SYNC_LOG")
-    [[ -f "$REFL_LOG" ]] && files_to_remove+=("$REFL_LOG")
-
-    if [[ ${#files_to_remove[@]} -gt 0 ]]; then
-        rm -f "${files_to_remove[@]}"
-    fi
-}
-
-trap cleanup EXIT INT TERM
-
 OUTPUT_FILE=$(mktemp) || exit 1
 SYNC_LOG=$(mktemp) || exit 1
 REFL_LOG=$(mktemp) || exit 1
