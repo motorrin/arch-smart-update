@@ -1598,13 +1598,96 @@ if [[ -n "${AUR_HELPER_OVERRIDE:-}" ]]; then
 fi
 
 if [[ -z "$AUR_HELPER" ]]; then
-    for helper in "paru" "yay" "pikaur" "trizen" "aura" "pacaur"; do
+    for helper in "shelly" "paru" "yay" "pikaur" "trizen" "aura" "pacaur"; do
         if command -v "$helper" &>/dev/null; then
             AUR_HELPER="$helper"
             break
         fi
     done
 fi
+
+AUR_HELPER_BIN=""
+if [[ -n "$AUR_HELPER" ]]; then
+    AUR_HELPER_BIN=$(echo "$AUR_HELPER" | awk '{print $1}')
+fi
+
+get_aur_updates() {
+    local source_mode="${1:-live}"
+    [[ -z "$AUR_HELPER" ]] && return 0
+
+    if [[ "$AUR_HELPER_BIN" == "shelly" ]]; then
+        local shelly_json
+        shelly_json=$($AUR_HELPER aur list-updates --json 2>/dev/null) || return 0
+        [[ -z "$shelly_json" ]] && return 0
+
+        # Fast-path: no AUR updates.
+        if [[ "$(printf "%s" "$shelly_json" | tr -d '[:space:]')" == "[]" ]]; then
+            return 0
+        fi
+
+        python3 -c '
+import json
+import sys
+
+try:
+    data = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+
+if not isinstance(data, list):
+    sys.exit(0)
+
+for row in data:
+    if not isinstance(row, dict):
+        continue
+    name = row.get("Name") or row.get("name")
+    old = row.get("Version") or row.get("version")
+    new = row.get("NewVersion") or row.get("newVersion") or row.get("new_version")
+    if name and old and new:
+        print(f"{name} {old} -> {new}")
+' <<< "$shelly_json"
+        return 0
+    fi
+
+    if [[ "$source_mode" == "tempdb" ]]; then
+        $AUR_HELPER -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null
+    else
+        $AUR_HELPER -Qua --color never 2>/dev/null
+    fi
+}
+
+get_standard_upgrade_cmd() {
+    if [[ "$AUR_HELPER_BIN" == "shelly" ]]; then
+        echo "$AUR_HELPER upgrade"
+    elif [[ -n "$AUR_HELPER" ]]; then
+        echo "$AUR_HELPER -Syu"
+    else
+        echo "sudo pacman -Syu"
+    fi
+}
+
+get_aur_only_upgrade_cmd() {
+    if [[ "$AUR_HELPER_BIN" == "shelly" ]]; then
+        echo "$AUR_HELPER aur upgrade"
+        return
+    fi
+
+    local aur_flags="-Syu"
+    if [[ "$AUR_HELPER_BIN" =~ ^(yay|paru|pikaur|trizen)$ ]]; then
+        aur_flags="-Sua"
+    fi
+    echo "$AUR_HELPER $aur_flags"
+}
+
+get_helper_cache_clean_cmd() {
+    if [[ "$AUR_HELPER_BIN" == "shelly" ]]; then
+        echo "$AUR_HELPER cache-clean --uninstalled --no-confirm"
+    elif [[ -n "$AUR_HELPER" ]]; then
+        echo "$AUR_HELPER -Sc --noconfirm"
+    else
+        echo "sudo pacman -Sc --noconfirm"
+    fi
+}
 
 echo -e "\n${blue}${bold}Checking for updates...${reset}"
 
@@ -1619,13 +1702,13 @@ if [[ -f /var/lib/pacman/db.lck ]]; then
         lock_pid=$(sudo cat /var/lib/pacman/db.lck 2>/dev/null)
         if [[ "$lock_pid" =~ ^[0-9]+$ ]] && sudo kill -0 "$lock_pid" 2>/dev/null; then
             lock_comm=$(ps -p "$lock_pid" -o comm= 2>/dev/null || sudo cat "/proc/$lock_pid/comm" 2>/dev/null)
-            if [[ "$lock_comm" =~ (pacman|yay|paru|pamac|trizen|pikaur|aura|pacaur) ]]; then
+            if [[ "$lock_comm" =~ (pacman|shelly|yay|paru|pamac|trizen|pikaur|aura|pacaur) ]]; then
                 lock_active=true
             fi
         fi
         
         if [[ "$lock_active" == false ]]; then
-            if pgrep -x "pacman" >/dev/null 2>&1 || pgrep -x "yay" >/dev/null 2>&1 || pgrep -x "paru" >/dev/null 2>&1; then
+            if pgrep -x "pacman" >/dev/null 2>&1 || pgrep -x "shelly" >/dev/null 2>&1 || pgrep -x "yay" >/dev/null 2>&1 || pgrep -x "paru" >/dev/null 2>&1; then
                 lock_active=true
             fi
         fi
@@ -1800,7 +1883,7 @@ repo_updates=$(LC_ALL=C pacman -Qu --dbpath "$CHECK_DB" --color never)
 
 aur_updates=""
 if [[ -n "$AUR_HELPER" ]]; then
-    if aur_raw=$($AUR_HELPER -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null); then
+    if aur_raw=$(get_aur_updates "tempdb"); then
         aur_updates="$aur_raw"
     fi
 fi
@@ -1911,10 +1994,16 @@ fi
 
 if [[ -n "$aur_pkgs" && -n "$AUR_HELPER" ]]; then
     log_step "Fetching AUR metadata..."
-    # shellcheck disable=SC2086
-    while IFS='' read -r line; do
-        NEW_DATA["${line%%~|~*}"]="${line#*~|~}"
-    done < <(echo "$aur_pkgs" | xargs -r env LC_ALL=C $AUR_HELPER -Si 2>/dev/null | parse_metadata "AUR")
+    if [[ "$AUR_HELPER_BIN" == "shelly" ]]; then
+        while read -r pkg; do
+            [[ -n "$pkg" ]] && NEW_DATA["$pkg"]="AUR|N/A|N/A|"
+        done <<< "$aur_pkgs"
+    else
+        # shellcheck disable=SC2086
+        while IFS='' read -r line; do
+            NEW_DATA["${line%%~|~*}"]="${line#*~|~}"
+        done < <(echo "$aur_pkgs" | xargs -r env LC_ALL=C $AUR_HELPER -Si 2>/dev/null | parse_metadata "AUR")
+    fi
 fi
 
 log_step "Fetching local metadata (pacman -Qi)..."
@@ -2488,7 +2577,7 @@ check_pending_updates() {
 
     if [[ "$check_mode" != "repo_only" && -n "$AUR_HELPER" ]]; then
         local aur_pending
-        aur_pending=$($AUR_HELPER -Qua --color never 2>/dev/null)
+        aur_pending=$(get_aur_updates)
 
         if [[ -n "$aur_pending" ]]; then
             if [[ -n "$pending" ]]; then
@@ -2509,12 +2598,16 @@ check_pending_updates() {
 }
 
 BEST_UPDATE_TOOL=""
-for tool in eos-update cachy-update arch-update; do
-    if command -v "$tool" &>/dev/null; then
-        BEST_UPDATE_TOOL="$tool"
-        break
-    fi
-done
+if command -v shelly &>/dev/null; then
+    BEST_UPDATE_TOOL="shelly upgrade-all"
+else
+    for tool in eos-update cachy-update arch-update; do
+        if command -v "$tool" &>/dev/null; then
+            BEST_UPDATE_TOOL="$tool"
+            break
+        fi
+    done
+fi
 
 HAS_TOPGRADE=false
 command -v topgrade &>/dev/null && HAS_TOPGRADE=true
@@ -2534,7 +2627,7 @@ elif [[ "$HAS_TOPGRADE" == "true" ]]; then
     PROMPT_CMD="topgrade"
 else
     if [[ -n "$AUR_HELPER" ]]; then
-        PROMPT_CMD="$AUR_HELPER -Syu"
+        PROMPT_CMD="$(get_standard_upgrade_cmd)"
     else
         PROMPT_CMD="sudo pacman -Syu"
     fi
@@ -2560,7 +2653,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
         has_pkg_mgr=false
         for cmd in "${CUSTOM_CMDS[@]}"; do
-            if [[ "$cmd" =~ (pacman|yay|paru|eos-update|cachy-update|arch-update|topgrade|pikaur|trizen|aura|pacaur) ]]; then
+            if [[ "$cmd" =~ (pacman|shelly|yay|paru|eos-update|cachy-update|arch-update|topgrade|pikaur|trizen|aura|pacaur) ]]; then
                 has_pkg_mgr=true
                 break
             fi
@@ -2597,7 +2690,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         if $UPDATE_SUCCESS && [[ "$RUN_STANDARD" == false ]]; then
             if [[ -n "$(check_pending_updates)" ]]; then
                 echo -e "\n${yellow}Custom commands finished successfully, but standard pacman updates were skipped.${reset}"
-                echo -e "${dim}To update the system too, answer 'Y' to the prompt or add 'yay -Syu' to CUSTOM_CMDS.${reset}"
+                echo -e "${dim}To update the system too, answer 'Y' to the prompt or add 'shelly upgrade' (or your preferred helper command) to CUSTOM_CMDS.${reset}"
             fi
         fi
 
@@ -2682,15 +2775,12 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                     echo -e "\n${yellow}$tool_name did not fully apply all updates (likely AUR packages remaining).${reset}"
 
                     helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
-                    aur_flags="-Syu"
-                    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen)$ && $core_exit -eq 0 ]]; then
-                        aur_flags="-Sua"
-                    fi
+                    aur_cmd=$(get_aur_only_upgrade_cmd)
 
                     echo -ne "${white}Run $helper_bin to apply remaining updates? [Y/n]: ${reset}"
                     if read -r force_aur; then
                         if [[ "$force_aur" =~ ^[Yy]$ || -z "$force_aur" ]]; then
-                            execute_update_task "$AUR_HELPER $aur_flags"
+                            execute_update_task "$aur_cmd"
 
                             if [[ $? -eq 0 && -z "$(check_pending_updates)" ]]; then
                                 UPDATE_SUCCESS=true
@@ -2722,7 +2812,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         else
             echo -e "${blue}${bold}Running standard system update...${reset}\n"
             if [[ -n "$AUR_HELPER" ]]; then
-                execute_update_task "$AUR_HELPER -Syu"
+                execute_update_task "$(get_standard_upgrade_cmd)"
                 core_exit=$?
             else
                 execute_update_task "sudo pacman -Syu"
@@ -2758,11 +2848,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
             echo -e "${dim}Clearing partial downloads and package cache...${reset}"
             sudo rm -rf /var/cache/pacman/pkg/download-* 2>/dev/null
-            if [[ -n "$AUR_HELPER" ]]; then
-                $AUR_HELPER -Sc --noconfirm >/dev/null 2>&1
-            else
-                sudo pacman -Sc --noconfirm >/dev/null 2>&1
-            fi
+            execute_update_task "$(get_helper_cache_clean_cmd)" >/dev/null 2>&1
 
             helper_bin=$(echo "${AUR_HELPER:-}" | awk '{print $1}')
             helpers_to_clean=()
@@ -2771,7 +2857,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                 helpers_to_clean+=("$helper_bin")
             fi
             
-            for h in "yay" "paru" "pikaur" "trizen" "pacaur"; do
+            for h in "shelly" "yay" "paru" "pikaur" "trizen" "pacaur"; do
                 if [[ "$h" != "$helper_bin" ]]; then
                     helpers_to_clean+=("$h")
                 fi
