@@ -1694,7 +1694,8 @@ if [[ "$DAEMON_MODE" == "false" ]]; then
         if [[ ! -f "$CONFIG_DIR/.aur_warned" ]]; then
             echo -e "${yellow}Warning: No supported AUR helper detected on your system.${reset}"
             echo -e "${gray}Arch Smart Update will only manage official repository packages.${reset}"
-            echo -e "${gray}To enable AUR support, consider installing an AUR helper like 'yay' or 'paru'.${reset}\n"
+            echo -e "${gray}To enable AUR support, consider installing an AUR helper like 'yay' or 'paru'.${reset}"
+            echo -e "${dim}Note: This warning is shown only once. The limitation persists silently on future runs.${reset}\n"
             if [[ -n "$CONFIG_DIR" && -d "$CONFIG_DIR" ]]; then
                 touch "$CONFIG_DIR/.aur_warned" 2>/dev/null
             fi
