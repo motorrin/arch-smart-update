@@ -1685,12 +1685,20 @@ if [[ -n "$AUR_HELPER" ]]; then
     helper_bin="${HELPER_CMD[0]}"
 fi
 
-if [[ -z "$AUR_HELPER" && "$DAEMON_MODE" == "false" ]]; then
-    if [[ ! -f "$CONFIG_DIR/.aur_warned" ]]; then
-        echo -e "${yellow}Warning: No supported AUR helper detected on your system.${reset}"
-        echo -e "${gray}Arch Smart Update will only manage official repository packages.${reset}"
-        echo -e "${gray}To enable AUR support, consider installing an AUR helper like 'yay' or 'paru'.${reset}\n"
-        touch "$CONFIG_DIR/.aur_warned" 2>/dev/null
+if [[ "$DAEMON_MODE" == "false" ]]; then
+    if [[ -n "$AUR_HELPER" ]]; then
+        if [[ -n "$CONFIG_DIR" && -d "$CONFIG_DIR" && -f "$CONFIG_DIR/.aur_warned" ]]; then
+            rm -f "$CONFIG_DIR/.aur_warned" 2>/dev/null
+        fi
+    else
+        if [[ ! -f "$CONFIG_DIR/.aur_warned" ]]; then
+            echo -e "${yellow}Warning: No supported AUR helper detected on your system.${reset}"
+            echo -e "${gray}Arch Smart Update will only manage official repository packages.${reset}"
+            echo -e "${gray}To enable AUR support, consider installing an AUR helper like 'yay' or 'paru'.${reset}\n"
+            if [[ -n "$CONFIG_DIR" && -d "$CONFIG_DIR" ]]; then
+                touch "$CONFIG_DIR/.aur_warned" 2>/dev/null
+            fi
+        fi
     fi
 fi
 
