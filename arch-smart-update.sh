@@ -70,6 +70,7 @@ SYNC_LOG=""
 REFL_LOG=""
 CHECK_DB=""
 SUDO_KEEP_ALIVE_PID=""
+CURRENT_TMP_LOG=""
 
 cleanup() {
     if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill -0 "$SUDO_KEEP_ALIVE_PID" 2>/dev/null; then
@@ -88,6 +89,7 @@ cleanup() {
     [[ -f "$SYNC_LOG" ]] && files_to_remove+=("$SYNC_LOG")
     [[ -f "$REFL_LOG" ]] && files_to_remove+=("$REFL_LOG")
     [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF.tmp" ]] && files_to_remove+=("$SETTINGS_CONF.tmp")
+    [[ -n "${CURRENT_TMP_LOG:-}" && -f "$CURRENT_TMP_LOG" ]] && files_to_remove+=("$CURRENT_TMP_LOG")
 
     if [[ ${#files_to_remove[@]} -gt 0 ]]; then
         rm -f "${files_to_remove[@]}"
@@ -140,7 +142,7 @@ update_from_github() {
         fi
 
         if [[ "$filename" == "settings.default.conf" ]]; then
-            if awk '/^CUSTOM_CMDS=\(/ {in_block=1; next} in_block && /^\)/ {in_block=0} in_block && /^[[:space:]]*[^#[:space:]]/ {print "DANGER"; exit}' "$tmp_file" | grep -q "DANGER"; then
+            if awk '/^[[:space:]]*CUSTOM_CMDS(\+)?=[[:space:]]*\(/ {in_block=1; next} in_block && /^[[:space:]]*\)/ {in_block=0} in_block && /^[[:space:]]*[^#[:space:]]/ {print "DANGER"; exit}' "$tmp_file" | grep -q "DANGER"; then
                 rm -f "$tmp_file"
                 [[ ! -f "$file_path" ]] && echo -e "${red}Security Alert: Active custom commands detected in default settings. Download rejected!${reset}"
                 return 1
@@ -373,14 +375,14 @@ for line_raw in t_lines:
             el = u_ar.get(arr_name)
             if el is not None:
                 if el:
-                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
                     for item in el:
                         out.append(f"    {item}\n")
                 else:
-                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
             else:
                 default_el = t_ar.get(arr_name, [])
-                print(f"  {DIM}[Thinking]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
             out.append(line_raw)
             in_arr = False
         else:
@@ -401,15 +403,15 @@ for line_raw in t_lines:
                 out.pop()
                 out.append(f"{arr_name}=(\n")
                 if el:
-                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
                     for item in el:
                         out.append(f"    {item}\n")
                 else:
-                    print(f"  {DIM}[Thinking]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
                 out.append(")\n")
             else:
                 default_el = t_ar.get(arr_name, [])
-                print(f"  {DIM}[Thinking]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
         else:
             in_arr = True
         continue
@@ -423,9 +425,9 @@ for line_raw in t_lines:
             user_val = u_sc[k]
             default_val = t_sc.get(k, "N/A")
             if user_val != default_val:
-                print(f"  {DIM}[Thinking]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
             else:
-                print(f"  {DIM}[Thinking]{RESET} Option {CYAN}{k:<23}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
             out.append(f"{k}={user_val}\n")
             continue
         else:
@@ -434,7 +436,7 @@ for line_raw in t_lines:
                 continue
             else:
                 default_val = t_sc.get(k, "N/A")
-                print(f"  {DIM}[Thinking]{RESET} Option {MAGENTA}{k:<23}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {MAGENTA}{k:<23}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
                 out.append(line_raw)
                 continue
 
@@ -445,9 +447,9 @@ orphan_arrays = set(u_ar.keys()) - migrated_arrays
 if orphans or orphan_arrays:
     print(f"\n{YELLOW}{BOLD}:: Deprecated parameter cleanup:{RESET}")
     for o in orphans:
-        print(f"  {DIM}[Thinking]{RESET} Option {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
+        print(f"  {DIM}[Analyzing]{RESET} Option {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
     for o in orphan_arrays:
-        print(f"  {DIM}[Thinking]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
+        print(f"  {DIM}[Analyzing]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
 
 with open(sys.argv[3], "w", encoding="utf-8") as f:
     f.writelines(out)
@@ -508,7 +510,7 @@ parse_bash_array() {
     awk -v var="$arr_name" '
         BEGIN { in_arr=0 }
         { sub(/^[[:space:]]*#.*/, "") }
-        $0 ~ "^"var"(\\+)?=\\s*\\(" { in_arr=1; sub(/^.*\(/, "") }
+        $0 ~ "^[[:space:]]*"var"(\\+)?=\\s*\\(" { in_arr=1; sub(/^.*\(/, "") }
         in_arr {
             tmp = $0
             while (match(tmp, /"[^"]*"|\047[^\047]*\047/)) {
@@ -661,29 +663,21 @@ fi
 
 if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
     while IFS= read -r line; do
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "$line" || "$line" == "#"* || "$line" != *"="* ]] && continue
-
+        line="${line%$'\r'}"
         line="${line%%[[:space:]]#*}"
-        line="${line%"${line##*[![:space:]]}"}"
-        [[ -z "$line" || "$line" != *"="* ]] && continue
-
-        key="${line%%=*}"
-        val="${line#*=}"
-        val="${val%$'\r'}"
-        key="${key#"${key%%[![:space:]]*}"}"
-        key="${key%"${key##*[![:space:]]}"}"
-        val="${val#"${val%%[![:space:]]*}"}"
-        val="${val%"${val##*[![:space:]]}"}"
-        if [[ "$val" == \"*\" && "$val" == *\" ]] || [[ "$val" == \'*\' && "$val" == *\' ]]; then
-            val="${val:1:-1}"
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            val="${val%"${val##*[![:space:]]}"}"
+            if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            case "$key" in
+                AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP|SILENCE_UPDATES)
+                    declare -g "$key=$val"
+                    ;;
+            esac
         fi
-
-        case "$key" in
-            AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP|SILENCE_UPDATES)
-                declare -g "$key=$val" ;;
-        esac
     done < "$SETTINGS_CONF"
 
     mapfile -t USER_NUKE < <(parse_bash_array "$SETTINGS_CONF" "USER_NUCLEAR_PKGS")
@@ -1053,7 +1047,7 @@ check_arch_news() {
     log_step "Starting Arch News check (Python)..."
     echo -ne "${gray}Checking Arch News...${reset}"
 
-    if news_ts=$(python3 -c "
+    if news_ts=$(python3 <<'EOF' 2>/dev/null
 import sys, urllib.request, xml.etree.ElementTree as ET, email.utils
 try:
     req = urllib.request.Request('https://archlinux.org/feeds/news/', headers={'User-Agent': 'ArchSmartUpdate/1.0'})
@@ -1068,7 +1062,8 @@ try:
         sys.exit(1)
 except Exception:
     sys.exit(1)
-"); then
+EOF
+    ); then
         now_time=$(date +%s)
         diff_hours=$(( (now_time - news_ts) / 3600 ))
 
@@ -1262,11 +1257,88 @@ execute_update_task() {
     local cmd="$1"
 
     if [[ "${ASU_TTY_OUT:-}" =~ ^[0-9]+$ ]] && [[ "${ASU_TTY_ERR:-}" =~ ^[0-9]+$ ]] && [ -t "$ASU_TTY_OUT" ] && [ -t 0 ]; then
-        /bin/bash -c "$cmd" 1>&$ASU_TTY_OUT 2>&$ASU_TTY_ERR
-        return
+        if [[ "${GENERATE_LOGS,,}" == "true" && -n "${LOG_FILE:-}" ]]; then
+            local log_dir
+            log_dir=$(dirname "$LOG_FILE")
+            if [ -d "$log_dir" ] && [ -w "$log_dir" ] && { [ ! -e "$LOG_FILE" ] || { [ -f "$LOG_FILE" ] && [ -w "$LOG_FILE" ]; }; }; then
+                if command -v script >/dev/null 2>&1; then
+                    if env SHELL=/bin/bash script -f -q -e -c "true" /dev/null >/dev/null 2>&1; then
+                        local tmp_log
+                        local safe_tmp_dir="${XDG_RUNTIME_DIR:-$CONFIG_DIR}"
+                        if [[ ! -d "$safe_tmp_dir" || ! -w "$safe_tmp_dir" ]]; then
+                            safe_tmp_dir="/tmp"
+                        fi
+                        if tmp_log=$(mktemp "$safe_tmp_dir/asu_task.XXXXXX" 2>/dev/null); then
+                            CURRENT_TMP_LOG="$tmp_log"
+                            local wrapper="$cmd"
+                            local first_word
+                            first_word=$(echo "$cmd" | awk '{print $1}')
+                            if [[ "$first_word" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura|rua|topgrade|eos-update|cachy-update|arch-update)$ ]]; then
+                                wrapper="sudo -v && $cmd"
+                            fi
+                            env SHELL=/bin/bash script -f -q -e -c "$wrapper" "$tmp_log" <&0 1>&$ASU_TTY_OUT 2>&$ASU_TTY_ERR
+                            local ret=$?
+                            if [ -f "$tmp_log" ]; then
+                                env PYTHONIOENCODING=utf-8 python3 - "$tmp_log" <<'EOF' >> "$LOG_FILE" 2>/dev/null
+import sys, re
+
+ansi_escape = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+try:
+    with open(sys.argv[1], "r", encoding="utf-8", errors="replace", newline="\n") as f:
+        for line in f:
+            line_clean = ansi_escape.sub("", line.rstrip("\r\n"))
+            if "\r" in line_clean:
+                parts = line_clean.split("\r")
+                final_parts = []
+                last_p = ""
+                for p in parts:
+                    p_stripped = p.strip()
+                    if not p_stripped:
+                        continue
+                    if last_p:
+                        prefix_len = 0
+                        for c1, c2 in zip(last_p, p):
+                            if c1 == c2:
+                                prefix_len += 1
+                            else:
+                                break
+                        suffix_len = 0
+                        for c1, c2 in zip(reversed(last_p), reversed(p)):
+                            if c1 == c2:
+                                suffix_len += 1
+                            else:
+                                break
+                        if prefix_len >= 3 or suffix_len >= 5 or last_p in p or p in last_p:
+                            last_p = p
+                        else:
+                            final_parts.append(last_p)
+                            last_p = p
+                    else:
+                        last_p = p
+                if last_p:
+                    final_parts.append(last_p)
+                for fp in final_parts:
+                    print(fp)
+            else:
+                print(line_clean)
+except BaseException:
+    sys.exit(0)
+EOF
+                                rm -f "$tmp_log"
+                            fi
+                            CURRENT_TMP_LOG=""
+                            return $ret
+                        fi
+                    fi
+                fi
+            fi
+            /bin/bash -c "$cmd" 1>&$ASU_TTY_OUT 2>&$ASU_TTY_ERR
+            return $?
+        fi
     fi
 
     /bin/bash -c "$cmd"
+    return $?
 }
 
 check_reboot_needed() {
@@ -1598,12 +1670,28 @@ if [[ -n "${AUR_HELPER_OVERRIDE:-}" ]]; then
 fi
 
 if [[ -z "$AUR_HELPER" ]]; then
-    for helper in "paru" "yay" "pikaur" "trizen" "aura" "pacaur"; do
+    for helper in "paru" "yay" "pikaur" "trizen" "aura" "pacaur" "pakku" "rua"; do
         if command -v "$helper" &>/dev/null; then
             AUR_HELPER="$helper"
             break
         fi
     done
+fi
+
+declare -a HELPER_CMD=()
+helper_bin=""
+if [[ -n "$AUR_HELPER" ]]; then
+    read -ra HELPER_CMD <<< "$AUR_HELPER"
+    helper_bin="${HELPER_CMD[0]}"
+fi
+
+if [[ -z "$AUR_HELPER" && "$DAEMON_MODE" == "false" ]]; then
+    if [[ ! -f "$CONFIG_DIR/.aur_warned" ]]; then
+        echo -e "${yellow}Warning: No supported AUR helper detected on your system.${reset}"
+        echo -e "${gray}Arch Smart Update will only manage official repository packages.${reset}"
+        echo -e "${gray}To enable AUR support, consider installing an AUR helper like 'yay' or 'paru'.${reset}\n"
+        touch "$CONFIG_DIR/.aur_warned" 2>/dev/null
+    fi
 fi
 
 echo -e "\n${blue}${bold}Checking for updates...${reset}"
@@ -1619,13 +1707,14 @@ if [[ -f /var/lib/pacman/db.lck ]]; then
         lock_pid=$(sudo cat /var/lib/pacman/db.lck 2>/dev/null)
         if [[ "$lock_pid" =~ ^[0-9]+$ ]] && sudo kill -0 "$lock_pid" 2>/dev/null; then
             lock_comm=$(ps -p "$lock_pid" -o comm= 2>/dev/null || sudo cat "/proc/$lock_pid/comm" 2>/dev/null)
-            if [[ "$lock_comm" =~ (pacman|yay|paru|pamac|trizen|pikaur|aura|pacaur) ]]; then
+            lock_regex='pacman|yay|paru|pamac|trizen|pikaur|aura|pacaur|pakku|rua'
+            if [[ "$lock_comm" =~ $lock_regex ]]; then
                 lock_active=true
             fi
         fi
         
         if [[ "$lock_active" == false ]]; then
-            if pgrep -x "pacman" >/dev/null 2>&1 || pgrep -x "yay" >/dev/null 2>&1 || pgrep -x "paru" >/dev/null 2>&1; then
+            if pgrep -x "pacman|yay|paru|pikaur|pakku|aura|trizen|pacaur|pamac|rua" >/dev/null 2>&1; then
                 lock_active=true
             fi
         fi
@@ -1789,8 +1878,7 @@ ignored_pkgs=$(pacman-conf IgnorePkg 2>/dev/null | tr ' ' '\n')
 ignored_groups=$(pacman-conf IgnoreGroup 2>/dev/null | tr ' ' '\n')
 
 if [[ -n "$ignored_groups" ]]; then
-    # shellcheck disable=SC2086
-    group_pkgs=$(pacman -Sgq $ignored_groups 2>/dev/null)
+    group_pkgs=$(echo "$ignored_groups" | xargs -r pacman -Sgq 2>/dev/null)
     ignored_pkgs="$ignored_pkgs"$'\n'"$group_pkgs"
 fi
 
@@ -1800,8 +1888,37 @@ repo_updates=$(LC_ALL=C pacman -Qu --dbpath "$CHECK_DB" --color never)
 
 aur_updates=""
 if [[ -n "$AUR_HELPER" ]]; then
-    if aur_raw=$($AUR_HELPER -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null); then
-        aur_updates="$aur_raw"
+    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
+    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
+        if aur_raw=$("${HELPER_CMD[@]}" -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null); then
+            aur_updates="$aur_raw"
+        fi
+    else
+        if aur_raw=$(python3 -c '
+import urllib.request, json, sys, subprocess, urllib.parse
+try:
+    res = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True, check=True)
+    local_pkgs = {line.split()[0]: line.split()[1] for line in res.stdout.strip().split("\n") if len(line.split()) >= 2}
+    if not local_pkgs: sys.exit(0)
+    names = list(local_pkgs.keys())
+    aur_data = []
+    for i in range(0, len(names), 100):
+        chunk = names[i:i+100]
+        args = "&".join(f"arg[]={urllib.parse.quote(n)}" for n in chunk)
+        req = urllib.request.Request(f"https://aur.archlinux.org/rpc/?v=5&type=info&{args}", headers={"User-Agent": "ArchSmartUpdate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("type") != "error": aur_data.extend(data.get("results", []))
+    for item in aur_data:
+        name, new_ver = item.get("Name"), item.get("Version")
+        old_ver = local_pkgs.get(name)
+        if old_ver and new_ver:
+            vc = subprocess.run(["vercmp", new_ver, old_ver], capture_output=True, text=True)
+            if vc.returncode == 0 and int(vc.stdout.strip() or 0) > 0:
+                print(f"{name} {old_ver} -> {new_ver}")
+except Exception: pass' 2>/dev/null); then
+            aur_updates="$aur_raw"
+        fi
     fi
 fi
 
@@ -1911,10 +2028,33 @@ fi
 
 if [[ -n "$aur_pkgs" && -n "$AUR_HELPER" ]]; then
     log_step "Fetching AUR metadata..."
-    # shellcheck disable=SC2086
-    while IFS='' read -r line; do
-        NEW_DATA["${line%%~|~*}"]="${line#*~|~}"
-    done < <(echo "$aur_pkgs" | xargs -r env LC_ALL=C $AUR_HELPER -Si 2>/dev/null | parse_metadata "AUR")
+    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
+    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
+        while IFS='' read -r line; do
+            NEW_DATA["${line%%~|~*}"]="${line#*~|~}"
+        done < <(echo "$aur_pkgs" | xargs -r env LC_ALL=C "${HELPER_CMD[@]}" -Si 2>/dev/null | parse_metadata "AUR")
+    else
+        while IFS='' read -r line; do
+            NEW_DATA["${line%%~|~*}"]="${line#*~|~}"
+        done < <(echo "$aur_pkgs" | python3 -c '
+import urllib.request, json, sys, urllib.parse
+try:
+    names = [line.strip() for line in sys.stdin if line.strip()]
+    if not names: sys.exit(0)
+    aur_data = []
+    for i in range(0, len(names), 100):
+        chunk = names[i:i+100]
+        args = "&".join(f"arg[]={urllib.parse.quote(n)}" for n in chunk)
+        req = urllib.request.Request(f"https://aur.archlinux.org/rpc/?v=5&type=info&{args}", headers={"User-Agent": "ArchSmartUpdate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("type") != "error": aur_data.extend(data.get("results", []))
+    for item in aur_data:
+        name = item.get("Name")
+        desc = item.get("Description", "").replace("|", " ").replace("\t", " ").replace("~", " ")
+        print(f"{name}~|~AUR|N/A|N/A|{desc}")
+except Exception: pass' 2>/dev/null)
+    fi
 fi
 
 log_step "Fetching local metadata (pacman -Qi)..."
@@ -2487,14 +2627,51 @@ check_pending_updates() {
     pending=$(LC_ALL=C pacman -Qu 2>/dev/null)
 
     if [[ "$check_mode" != "repo_only" && -n "$AUR_HELPER" ]]; then
-        local aur_pending
-        aur_pending=$($AUR_HELPER -Qua --color never 2>/dev/null)
+        local helper_bin
+        helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
+        if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
+            local aur_pending
+            aur_pending=$("${HELPER_CMD[@]}" -Qua --color never 2>/dev/null)
 
-        if [[ -n "$aur_pending" ]]; then
-            if [[ -n "$pending" ]]; then
-                pending="$pending"$'\n'"$aur_pending"
-            else
-                pending="$aur_pending"
+            if [[ -n "$aur_pending" ]]; then
+                if [[ -n "$pending" ]]; then
+                    pending="$pending"$'\n'"$aur_pending"
+                else
+                    pending="$aur_pending"
+                fi
+            fi
+        else
+            local aur_pending
+            aur_pending=$(python3 -c '
+import urllib.request, json, sys, subprocess, urllib.parse
+try:
+    res = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True, check=True)
+    local_pkgs = {line.split()[0]: line.split()[1] for line in res.stdout.strip().split("\n") if len(line.split()) >= 2}
+    if not local_pkgs: sys.exit(0)
+    names = list(local_pkgs.keys())
+    aur_data = []
+    for i in range(0, len(names), 100):
+        chunk = names[i:i+100]
+        args = "&".join(f"arg[]={urllib.parse.quote(n)}" for n in chunk)
+        req = urllib.request.Request(f"https://aur.archlinux.org/rpc/?v=5&type=info&{args}", headers={"User-Agent": "ArchSmartUpdate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("type") != "error": aur_data.extend(data.get("results", []))
+    for item in aur_data:
+        name, new_ver = item.get("Name"), item.get("Version")
+        old_ver = local_pkgs.get(name)
+        if old_ver and new_ver:
+            vc = subprocess.run(["vercmp", new_ver, old_ver], capture_output=True, text=True)
+            if vc.returncode == 0 and int(vc.stdout.strip() or 0) > 0:
+                print(f"{name} {old_ver} -> {new_ver}")
+except Exception: pass' 2>/dev/null)
+
+            if [[ -n "$aur_pending" ]]; then
+                if [[ -n "$pending" ]]; then
+                    pending="$pending"$'\n'"$aur_pending"
+                else
+                    pending="$aur_pending"
+                fi
             fi
         fi
     fi
@@ -2560,7 +2737,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
         has_pkg_mgr=false
         for cmd in "${CUSTOM_CMDS[@]}"; do
-            if [[ "$cmd" =~ (pacman|yay|paru|eos-update|cachy-update|arch-update|topgrade|pikaur|trizen|aura|pacaur) ]]; then
+            if [[ "$cmd" =~ (pacman|yay|paru|eos-update|cachy-update|arch-update|topgrade|pikaur|trizen|aura|pacaur|pakku|rua) ]]; then
                 has_pkg_mgr=true
                 break
             fi
@@ -2683,8 +2860,10 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
                     helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
                     aur_flags="-Syu"
-                    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen)$ && $core_exit -eq 0 ]]; then
+                    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku)$ && $core_exit -eq 0 ]]; then
                         aur_flags="-Sua"
+                    elif [[ "$helper_bin" == "rua" ]]; then
+                        aur_flags="upgrade"
                     fi
 
                     echo -ne "${white}Run $helper_bin to apply remaining updates? [Y/n]: ${reset}"
@@ -2720,10 +2899,15 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             fi
 
         else
-            echo -e "${blue}${bold}Running standard system update...${reset}\n"
+            echo -e "${blue}${bold}Running standard system update...${reset}"
             if [[ -n "$AUR_HELPER" ]]; then
-                execute_update_task "$AUR_HELPER -Syu"
-                core_exit=$?
+                if [[ "$helper_bin" == "rua" ]]; then
+                    execute_update_task "sudo pacman -Syu && rua upgrade"
+                    core_exit=$?
+                else
+                    execute_update_task "$AUR_HELPER -Syu"
+                    core_exit=$?
+                fi
             else
                 execute_update_task "sudo pacman -Syu"
                 core_exit=$?
@@ -2771,7 +2955,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                 helpers_to_clean+=("$helper_bin")
             fi
             
-            for h in "yay" "paru" "pikaur" "trizen" "pacaur"; do
+            for h in "yay" "paru" "pikaur" "trizen" "pacaur" "pakku" "aura" "rua"; do
                 if [[ "$h" != "$helper_bin" ]]; then
                     helpers_to_clean+=("$h")
                 fi
