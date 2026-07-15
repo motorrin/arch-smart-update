@@ -1,6 +1,8 @@
 #!/bin/bash
 
 # --- 1. Initialization & Environment Setup ---
+set -uo pipefail
+
 if [ -t 1 ]; then
     reset='\033[0m'
     bold='\033[1m'
@@ -21,7 +23,7 @@ else
     magenta='' cyan='' white='' gray='' bg_crit='' bg_nuke='' bg_feat=''
 fi
 
-if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo -e "${blue}${bold}Arch Smart Update${reset}"
     echo -e "\nUsage: ${white}${0##*/}${reset} [options]\n"
     echo -e "Options:"
@@ -41,19 +43,49 @@ fi
 exec {ASU_TTY_OUT}>&1 {ASU_TTY_ERR}>&2
 
 DAEMON_MODE=false
-if [[ "$1" == "--daemon" || "$1" == "--check" ]]; then
+if [[ "${1:-}" == "--daemon" || "${1:-}" == "--check" ]]; then
     DAEMON_MODE=true
 fi
 
 # --- 2. Configuration & External Files ---
-USER_HOME=$HOME
+USER_HOME="${HOME:-}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/arch-smart-update"
+mkdir -p "$CONFIG_DIR"
+
+ASU_TEMP_FILES=()
+ASU_TEMP_DIRS=()
+
+create_temp_file() {
+    local var_name="${1:-}"
+    local prefix="${2:-asu_temp}"
+    local tmp
+    tmp=$(mktemp "/tmp/${prefix}.XXXXXX") || exit 1
+    ASU_TEMP_FILES+=("$tmp")
+    eval "$var_name=\$tmp"
+}
+
+create_temp_dir() {
+    local var_name="${1:-}"
+    local prefix="${2:-asu_dir}"
+    local tmp
+    tmp=$(mktemp -d "/tmp/${prefix}.XXXXXX") || exit 1
+    ASU_TEMP_DIRS+=("$tmp")
+    eval "$var_name=\$tmp"
+}
 
 if ! $DAEMON_MODE && [ -d "$CONFIG_DIR" ]; then
-    if [[ "$(stat -Lc '%u' "$CONFIG_DIR" 2>/dev/null)" == "0" ]] || find "$CONFIG_DIR" -user root -print -quit 2>/dev/null | grep -q .; then
-        echo -e "${yellow}Detected files owned by root in config directory. Fixing ownership...${reset}"
-        if ! sudo chown -R "$(id -u):$(id -g)" "$CONFIG_DIR"; then
-            echo -e "${red}Error: Failed to fix ownership of config directory. Exiting.${reset}"
+    dir_owner=$(stat -Lc '%u' "$CONFIG_DIR" 2>/dev/null || echo "")
+    if [[ "$dir_owner" == "0" ]] || find "$CONFIG_DIR" -user root -print -quit 2>/dev/null | grep -q .; then
+        echo -e "${yellow}Detected files owned by root in config directory.${reset}"
+        echo -ne "${white}Fix ownership of config directory using sudo chown? [y/N]: ${reset}"
+        read -r chown_ans </dev/tty || chown_ans="n"
+        if [[ "$chown_ans" =~ ^[Yy]$ ]]; then
+            if ! sudo chown -R "$(id -u):$(id -g)" "$CONFIG_DIR"; then
+                echo -e "${red}Error: Failed to fix ownership of config directory. Exiting.${reset}"
+                exit 1
+            fi
+        else
+            echo -e "${red}Error: Root-owned files exist in config directory. Exiting.${reset}"
             exit 1
         fi
     fi
@@ -71,38 +103,41 @@ REFL_LOG=""
 CHECK_DB=""
 SUDO_KEEP_ALIVE_PID=""
 CURRENT_TMP_LOG=""
+MANIFEST_TMP=""
 
 cleanup() {
     if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill -0 "$SUDO_KEEP_ALIVE_PID" 2>/dev/null; then
         kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null
     fi
 
-    if [[ -n "$CHECK_DB" && -d "$CHECK_DB" && "$CHECK_DB" == /tmp/* && "$CHECK_DB" != "/tmp/" ]]; then
-        rm -rf -- "$CHECK_DB" 2>/dev/null
-        if [[ -d "$CHECK_DB" ]]; then
-            sudo rm -rf -- "$CHECK_DB" 2>/dev/null
-        fi
-    fi
-
     local files_to_remove=()
-    [[ -f "$OUTPUT_FILE" ]] && files_to_remove+=("$OUTPUT_FILE")
-    [[ -f "$SYNC_LOG" ]] && files_to_remove+=("$SYNC_LOG")
-    [[ -f "$REFL_LOG" ]] && files_to_remove+=("$REFL_LOG")
-    [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF.tmp" ]] && files_to_remove+=("$SETTINGS_CONF.tmp")
+    for f in "${ASU_TEMP_FILES[@]+"${ASU_TEMP_FILES[@]}"}"; do
+        [[ -f "$f" ]] && files_to_remove+=("$f")
+    done
+    [[ -n "${SETTINGS_CONF:-}" && -f "${SETTINGS_CONF}.tmp" ]] && files_to_remove+=("${SETTINGS_CONF}.tmp")
     [[ -n "${CURRENT_TMP_LOG:-}" && -f "$CURRENT_TMP_LOG" ]] && files_to_remove+=("$CURRENT_TMP_LOG")
 
     if [[ ${#files_to_remove[@]} -gt 0 ]]; then
         rm -f "${files_to_remove[@]}"
     fi
+
+    for d in "${ASU_TEMP_DIRS[@]+"${ASU_TEMP_DIRS[@]}"}"; do
+        if [[ -d "$d" && "$d" == /tmp/* && "$d" != "/tmp/" ]]; then
+            rm -rf -- "$d" 2>/dev/null
+            if [[ -d "$d" ]]; then
+                sudo rm -rf -- "$d" 2>/dev/null
+            fi
+        fi
+    done
 }
 
 trap cleanup EXIT INT TERM
 
 log_step() {
-    echo -e "${dim}[$(date +%T)] $1${reset}"
+    echo -e "${dim}[$(date +%T)] ${1:-}${reset}"
 }
 
-for cmd in python3 tar awk stat curl zstd; do
+for cmd in python3 tar awk stat curl zstd sha256sum grep sed vercmp; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${red}Error: Required command '$cmd' is not installed.${reset}"
         exit 1
@@ -110,7 +145,7 @@ for cmd in python3 tar awk stat curl zstd; do
 done
 
 prompt_user() {
-    local msg="$1" options="$2" var_name="$3"
+    local msg="${1:-}" options="${2:-}" var_name="${3:-}"
     local user_input=""
     if ! $DAEMON_MODE; then
         echo -ne "${white}${msg} [${options}]: ${reset}"
@@ -120,13 +155,13 @@ prompt_user() {
 }
 
 update_from_github() {
-    local file_path="$1"
-    local url="$2"
-    local expected_string="$3"
+    local file_path="${1:-}"
+    local url="${2:-}"
+    local expected_string="${3:-}"
     local filename
     filename=$(basename "$file_path")
     local tmp_file
-    tmp_file=$(mktemp "/tmp/${filename}.XXXXXX")
+    create_temp_file tmp_file "${filename}"
     local conn_timeout=2
     local max_time=4
     if [[ ! -f "$file_path" ]]; then
@@ -141,8 +176,29 @@ update_from_github() {
             return 1
         fi
 
+        local manifest_file="$CONFIG_DIR/manifest.sha256"
+        if [[ -f "$manifest_file" ]]; then
+            local remote_name
+            remote_name=$(basename "$url")
+            local expected_hash
+            expected_hash=$(awk -v fname="$remote_name" '{sub(/\r$/, ""); sub(/^\*/, "", $2); sub(/^.*\//, "", $2); if ($2 == fname) print $1}' "$manifest_file" 2>/dev/null || true)
+            if [[ -n "$expected_hash" ]]; then
+                local actual_hash
+                actual_hash=$(sha256sum "$tmp_file" | cut -d' ' -f1)
+                if [[ "$actual_hash" != "$expected_hash" ]]; then
+                    rm -f "$tmp_file"
+                    echo -e "${red}Security Alert: Integrity check failed for $filename. Hash mismatch!${reset}"
+                    return 1
+                fi
+            else
+                rm -f "$tmp_file"
+                echo -e "${red}Security Alert: File $filename is missing from the integrity manifest. Rejected!${reset}"
+                return 1
+            fi
+        fi
+
         if [[ "$filename" == "settings.default.conf" ]]; then
-            if awk '/^[[:space:]]*CUSTOM_CMDS(\+)?=[[:space:]]*\(/ {in_block=1; next} in_block && /^[[:space:]]*\)/ {in_block=0} in_block && /^[[:space:]]*[^#[:space:]]/ {print "DANGER"; exit}' "$tmp_file" | grep -q "DANGER"; then
+            if awk '/^[[:space:]]*CUSTOM_CMDS[[:space:]]*(\+)?[[:space:]]*=[[:space:]]*\(/ { in_block=1; sub(/^.*=[[:space:]]*\(/, ""); if ($0 ~ /\)/) { sub(/\).*$/, ""); sub(/#.*$/, ""); if ($0 ~ /[^[:space:]]/) { print "DANGER"; exit; } in_block=0; } else { sub(/#.*$/, ""); if ($0 ~ /[^[:space:]]/) { print "DANGER"; exit; } } next; } in_block && /^[[:space:]]*\)/ { in_block=0; next; } in_block && /^[[:space:]]*[^#[:space:]]/ { print "DANGER"; exit; }' "$tmp_file" | grep -q "DANGER"; then
                 rm -f "$tmp_file"
                 [[ ! -f "$file_path" ]] && echo -e "${red}Security Alert: Active custom commands detected in default settings. Download rejected!${reset}"
                 return 1
@@ -164,7 +220,7 @@ update_from_github() {
     fi
 }
 
-if [[ "$1" == "--reconfigure" ]]; then
+if [[ "${1:-}" == "--reconfigure" ]]; then
     SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
     removed_any=false
 
@@ -181,6 +237,20 @@ if [[ "$1" == "--reconfigure" ]]; then
         if [[ ! -f "$SETTINGS_DEFAULT" ]]; then
             echo -e "${yellow}Local settings.default.conf not found. Attempting template download...${reset}"
             if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
+                MANIFEST_TMP=""
+                create_temp_file MANIFEST_TMP "manifest"
+                if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"; then
+                    if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$MANIFEST_TMP"; then
+                        mv "$MANIFEST_TMP" "$CONFIG_DIR/manifest.sha256"
+                        MANIFEST_TMP=""
+                    else
+                        rm -f "$MANIFEST_TMP"
+                        MANIFEST_TMP=""
+                    fi
+                else
+                    rm -f "$MANIFEST_TMP"
+                    MANIFEST_TMP=""
+                fi
                 update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
             fi
         fi
@@ -480,33 +550,68 @@ EOF
 fi
 
 validate_user_conf() {
-    local file="$1"
-    local label="$2"
+    local file="${1:-}"
+    local label="${2:-}"
 
     [[ ! -f "$file" ]] && return 0
 
-    local owner
-    owner=$(stat -Lc '%u' "$file" 2>/dev/null)
+    local owner=""
+    owner=$(stat -Lc '%u' "$file" 2>/dev/null || echo "")
     local real_user
     real_user="$(id -u)"
-    if [[ "$owner" != "$real_user" && "$owner" != "0" ]]; then
+    if [[ -z "$owner" || ( "$owner" != "$real_user" && "$owner" != "0" ) ]]; then
         echo -e "${bg_nuke}SECURITY ${reset} ${red}$label is owned by '${owner:-UNKNOWN}', expected '$real_user' or 'root'. Refusing to load.${reset}"
         return 1
     fi
 
-    local perms
-    perms=$(stat -Lc '%a' "$file" 2>/dev/null)
-    if (( 8#${perms:-0} & 8#022 )); then
+    local perms=""
+    perms=$(stat -Lc '%a' "$file" 2>/dev/null || echo "")
+    if [[ -z "$perms" ]]; then
+        echo -e "${bg_nuke}SECURITY ${reset} ${red}Could not determine permissions for $label. Refusing to load.${reset}"
+        return 1
+    fi
+    if (( 8#${perms} & 8#022 )); then
         echo -e "${bg_nuke}SECURITY ${reset} ${red}$label is group/world-writable (${perms}). Refusing to load.${reset}"
         echo -e "${yellow}Fix with: chmod 600 \"$file\"${reset}"
         return 1
     fi
+
+    if [[ "$label" == "settings.conf" ]]; then
+        if awk '/^[[:space:]]*CUSTOM_CMDS[[:space:]]*(\+)?[[:space:]]*=[[:space:]]*\(/ { in_block=1; sub(/^.*=[[:space:]]*\(/, ""); if ($0 ~ /\)/) { sub(/\).*$/, ""); sub(/#.*$/, ""); if ($0 ~ /[^[:space:]]/) { print "DANGER"; exit; } in_block=0; } else { sub(/#.*$/, ""); if ($0 ~ /[^[:space:]]/) { print "DANGER"; exit; } } next; } in_block && /^[[:space:]]*\)/ { in_block=0; next; } in_block && /^[[:space:]]*[^#[:space:]]/ { print "DANGER"; exit; }' "$file" | grep -q "DANGER"; then
+            local conf_hash
+            conf_hash=$(sha256sum "$file" | cut -d' ' -f1)
+            local trust_file="$CONFIG_DIR/.trusted_hash"
+            local trusted=false
+            if [[ -f "$trust_file" ]] && [[ "$(cat "$trust_file" 2>/dev/null)" == "$conf_hash" ]]; then
+                trusted=true
+            fi
+            if [[ "$trusted" == "false" ]]; then
+                if ! $DAEMON_MODE; then
+                    local trust_ans
+                    echo -e "${yellow}Warning: Active custom commands detected in settings.conf.${reset}"
+                    echo -ne "${white}Do you trust and want to execute these custom commands? [y/N]: ${reset}"
+                    read -r trust_ans </dev/tty || trust_ans="n"
+                    if [[ "$trust_ans" =~ ^[Yy]$ ]]; then
+                        sha256sum "$file" | cut -d' ' -f1 > "$trust_file"
+                    else
+                        echo -e "${red}Error: Custom commands untrusted. Refusing to load settings.conf.${reset}"
+                        return 1
+                    fi
+                else
+                    echo -e "${red}Error: Unverified custom commands detected in settings.conf in background mode.${reset}"
+                    return 1
+                fi
+            fi
+        fi
+    fi
+
     return 0
 }
 
 parse_bash_array() {
-    local file=$1
-    local arr_name=$2
+    local file="${1:-}"
+    local arr_name="${2:-}"
+    [[ -z "$file" || ! -f "$file" ]] && return 0
     awk -v var="$arr_name" '
         BEGIN { in_arr=0 }
         { sub(/^[[:space:]]*#.*/, "") }
@@ -557,10 +662,34 @@ fi
 echo -e "${dim}Checking for configuration updates...${reset}"
 
 if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
-    update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/packages.conf" "NUCLEAR_PKGS"
-    update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
-    update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/daemon.template" "[TimerTemplate]"
-    update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/ASU.png" ""
+    manifest_updated=false
+    create_temp_file MANIFEST_TMP "manifest"
+    if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"; then
+        if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$MANIFEST_TMP"; then
+            mv "$MANIFEST_TMP" "$CONFIG_DIR/manifest.sha256"
+            MANIFEST_TMP=""
+            manifest_updated=true
+        else
+            rm -f "$MANIFEST_TMP"
+            MANIFEST_TMP=""
+            echo -e "${yellow}Warning: Downloaded manifest has an invalid format. Skipping config updates to prevent verification failures.${reset}"
+        fi
+    else
+        rm -f "$MANIFEST_TMP"
+        MANIFEST_TMP=""
+        echo -e "${yellow}Warning: Failed to update manifest.sha256. Skipping config updates to prevent verification failures.${reset}"
+    fi
+
+    if [[ -f "$CONFIG_DIR/manifest.sha256" ]]; then
+        if [ "$manifest_updated" = true ] || [ ! -f "$PKG_CONF" ] || [ ! -f "$SETTINGS_DEFAULT" ] || [ ! -f "$DAEMON_TEMPLATE" ] || [ ! -f "$ICON_PATH" ]; then
+            update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/packages.conf" "NUCLEAR_PKGS"
+            update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
+            update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/daemon.template" "[TimerTemplate]"
+            update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/ASU.png" ""
+        fi
+    else
+        echo -e "${red}Error: No local manifest available. Skipping configuration updates for security.${reset}"
+    fi
 else
     echo -e "${dim}GitHub is unreachable. Skipping configuration updates...${reset}"
 fi
@@ -661,6 +790,24 @@ else
     echo -e "${red}Could not load packages.conf. Using built-in basic fallbacks.${reset}"
 fi
 
+ENABLE_BACKGROUND_CHECK=false
+ENABLE_POST_CLEANUP=false
+CHECK_INTERVAL=30min
+START_DELAY=5min
+GENERATE_LOGS=false
+MAX_LOG_NUMBERS=5
+T_MIRROR_H=3
+T_FEAT_H=6
+T_CRIT_H=12
+T_DE_H=12
+T_NUKE_H=24
+IGNORE_PATCH_TIMERS=true
+SILENCE_UPDATES=6h
+PROMPT_MIRROR_REFRESH=false
+AUR_HELPER_OVERRIDE=""
+CUSTOM_REFLECTOR_CMD=""
+MAX_BACKUP_COPIES=5
+
 if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
     while IFS= read -r line; do
         line="${line%$'\r'}"
@@ -698,28 +845,14 @@ if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
     [[ "$T_NUKE_H" =~ ^[0-9]+$ ]] || T_NUKE_H=24
 fi
 
-: "${ENABLE_BACKGROUND_CHECK:=false}"
-: "${ENABLE_POST_CLEANUP:=false}"
-: "${CHECK_INTERVAL:=30min}"
-: "${START_DELAY:=5min}"
-: "${GENERATE_LOGS:=false}"
-: "${MAX_LOG_NUMBERS:=5}"
-: "${T_MIRROR_H:=3}"
-: "${T_FEAT_H:=6}"
-: "${T_CRIT_H:=12}"
-: "${T_DE_H:=12}"
-: "${T_NUKE_H:=24}"
-: "${IGNORE_PATCH_TIMERS:=true}"
-: "${SILENCE_UPDATES:=6h}"
-
 declare -A NUKE_MAP
-for pkg in "${NUCLEAR_PKGS[@]}"; do NUKE_MAP["$pkg"]=1; done
+for pkg in "${NUCLEAR_PKGS[@]+"${NUCLEAR_PKGS[@]}"}"; do NUKE_MAP["$pkg"]=1; done
 
 declare -A CRIT_MAP
-for pkg in "${CRITICAL_PKGS[@]}"; do CRIT_MAP["$pkg"]=1; done
+for pkg in "${CRITICAL_PKGS[@]+"${CRITICAL_PKGS[@]}"}"; do CRIT_MAP["$pkg"]=1; done
 
 declare -A FEAT_MAP
-for pkg in "${FEATURE_PKGS[@]}"; do FEAT_MAP["$pkg"]=1; done
+for pkg in "${FEATURE_PKGS[@]+"${FEATURE_PKGS[@]}"}"; do FEAT_MAP["$pkg"]=1; done
 
 sync_daemon_state() {
     local QUIET=false
@@ -743,7 +876,7 @@ sync_daemon_state() {
 
         if ! command -v systemctl >/dev/null 2>&1; then
             $QUIET || echo -e "${yellow}Notice: systemctl not found (non-systemd system).${reset}"
-            $QUIET || echo -e "${dim}To use the background checker, please manually schedule a cron job for: ${reset}${white}$(realpath "$(command -v "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")") --daemon${reset}"
+            $QUIET || echo -e "${dim}To use the background checker, please manually schedule a cron job for: ${reset}${white}$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")") --daemon${reset}"
             return 0
         fi
 
@@ -751,12 +884,18 @@ sync_daemon_state() {
 
         if [[ -f "$DAEMON_TEMPLATE" ]]; then
             local SCRIPT_PATH TMP_SVC TMP_TMR
-            SCRIPT_PATH="$(realpath "$(command -v "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")")"
-            TMP_SVC=$(mktemp)
-            TMP_TMR=$(mktemp)
+            SCRIPT_PATH="$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")")"
+            create_temp_file TMP_SVC "asu_svc"
+            create_temp_file TMP_TMR "asu_tmr"
 
             local CURRENT_INTERVAL="$CHECK_INTERVAL"
             local NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
+            local lock_file="$CONFIG_DIR/.state.lock"
+            local lock_fd=""
+
+            if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+                flock -x "$lock_fd"
+            fi
 
             if [[ -f "$NEXT_CHECK_FILE" ]]; then
                 local file_mtime
@@ -771,7 +910,7 @@ sync_daemon_state() {
 
             if [[ -f "$NEXT_CHECK_FILE" ]]; then
                 local next_ts
-                next_ts=$(cat "$NEXT_CHECK_FILE" 2>/dev/null)
+                next_ts=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
                 local now_ts
                 now_ts=$(date +%s)
 
@@ -781,6 +920,10 @@ sync_daemon_state() {
                 else
                     rm -f "$NEXT_CHECK_FILE"
                 fi
+            fi
+
+            if [[ -n "${lock_fd:-}" ]]; then
+                exec {lock_fd}<&-
             fi
 
             export SCRIPT_PATH START_DELAY CURRENT_INTERVAL
@@ -839,7 +982,7 @@ if [[ "$DAEMON_MODE" == true ]]; then
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$EUID}"
     export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
 
-    if [[ -z "$DBUS_SESSION_BUS_ADDRESS" || ( -z "$DISPLAY" && -z "$WAYLAND_DISPLAY" ) ]]; then
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" || ( -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ) ]]; then
         for pid in $(pgrep -u "$EUID" 2>/dev/null | sort -rn); do
             if [[ -r "/proc/$pid/environ" ]]; then
                 p_disp=""
@@ -862,24 +1005,24 @@ if [[ "$DAEMON_MODE" == true ]]; then
                 done < <(cat "/proc/$pid/environ" 2>/dev/null)
 
                 if [[ -n "$p_disp" || -n "$p_wayland" ]]; then
-                    [[ -z "$DISPLAY" && -n "$p_disp" ]] && export DISPLAY="$p_disp"
-                    [[ -z "$WAYLAND_DISPLAY" && -n "$p_wayland" ]] && export WAYLAND_DISPLAY="$p_wayland"
-                    [[ -z "$XAUTHORITY" && -n "$p_xauth" ]] && export XAUTHORITY="$p_xauth"
-                    [[ -z "$XDG_CURRENT_DESKTOP" && -n "$p_desktop" ]] && export XDG_CURRENT_DESKTOP="$p_desktop"
-                    [[ -z "$DBUS_SESSION_BUS_ADDRESS" && -n "$p_dbus" ]] && export DBUS_SESSION_BUS_ADDRESS="$p_dbus"
-                    [[ -z "$XDG_DATA_DIRS" && -n "$p_data" ]] && export XDG_DATA_DIRS="$p_data"
-                    [[ -z "$XDG_CONFIG_DIRS" && -n "$p_config" ]] && export XDG_CONFIG_DIRS="$p_config"
+                    [[ -z "${DISPLAY:-}" && -n "$p_disp" ]] && export DISPLAY="$p_disp"
+                    [[ -z "${WAYLAND_DISPLAY:-}" && -n "$p_wayland" ]] && export WAYLAND_DISPLAY="$p_wayland"
+                    [[ -z "${XAUTHORITY:-}" && -n "$p_xauth" ]] && export XAUTHORITY="$p_xauth"
+                    [[ -z "${XDG_CURRENT_DESKTOP:-}" && -n "$p_desktop" ]] && export XDG_CURRENT_DESKTOP="$p_desktop"
+                    [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "$p_dbus" ]] && export DBUS_SESSION_BUS_ADDRESS="$p_dbus"
+                    [[ -z "${XDG_DATA_DIRS:-}" && -n "$p_data" ]] && export XDG_DATA_DIRS="$p_data"
+                    [[ -z "${XDG_CONFIG_DIRS:-}" && -n "$p_config" ]] && export XDG_CONFIG_DIRS="$p_config"
                     break
                 fi
             fi
         done
     fi
 
-    if [[ -z "$XAUTHORITY" && -f "$HOME/.Xauthority" ]]; then
-        export XAUTHORITY="$HOME/.Xauthority"
+    if [[ -z "${XAUTHORITY:-}" && -f "${USER_HOME:-}/.Xauthority" ]]; then
+        export XAUTHORITY="${USER_HOME}/.Xauthority"
     fi
 
-    if [[ -z "$WAYLAND_DISPLAY" ]] && [[ -d "$XDG_RUNTIME_DIR" ]]; then
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]] && [[ -d "${XDG_RUNTIME_DIR:-}" ]]; then
         for sock in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
             if [[ -S "$sock" ]]; then
                 WAYLAND_DISPLAY="$(basename "$sock")"
@@ -888,7 +1031,7 @@ if [[ "$DAEMON_MODE" == true ]]; then
             fi
         done
     fi
-    if [[ -z "$DISPLAY" ]]; then
+    if [[ -z "${DISPLAY:-}" ]]; then
         for sock in /tmp/.X11-unix/X[0-9]*; do
             if [[ -S "$sock" ]]; then
                 export DISPLAY=":${sock:16}"
@@ -897,16 +1040,27 @@ if [[ "$DAEMON_MODE" == true ]]; then
         done
     fi
 
-    if [[ "${XDG_SESSION_TYPE,,}" == "x11" ]] || [[ "${XDG_CURRENT_DESKTOP,,}" =~ (xfce|lxqt|mate|cinnamon|i3) ]]; then
+    session_type="${XDG_SESSION_TYPE:-}"
+    desktop_env="${XDG_CURRENT_DESKTOP:-}"
+    if [[ "${session_type,,}" == "x11" ]] || [[ "${desktop_env,,}" =~ (xfce|lxqt|mate|cinnamon|i3) ]]; then
         unset WAYLAND_DISPLAY
     fi
 
     NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
-    if [[ "$1" == "--daemon" ]] && [[ -f "$NEXT_CHECK_FILE" ]]; then
-        NEXT_TS=$(cat "$NEXT_CHECK_FILE" 2>/dev/null)
+    if [[ "${1:-}" == "--daemon" ]] && [[ -f "$NEXT_CHECK_FILE" ]]; then
+        lock_file="$CONFIG_DIR/.state.lock"
+        lock_fd=""
+        if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+            flock -s "$lock_fd"
+        fi
+        NEXT_TS=0
+        NEXT_TS=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+        if [[ -n "${lock_fd:-}" ]]; then
+            exec {lock_fd}<&-
+        fi
         NOW_TS=$(date +%s)
         if [[ "$NEXT_TS" =~ ^[0-9]+$ ]] && (( NEXT_TS > NOW_TS + 300 )); then
-            target_time=$(date -d "@$NEXT_TS" +%H:%M)
+            target_time=$(date -d "@$NEXT_TS" +%H:%M || echo "00:00")
             log_step "Scheduled check is in the future ($target_time). Woke up early. Exiting."
             exit 0
         fi
@@ -923,7 +1077,7 @@ if [[ "${GENERATE_LOGS,,}" == "true" ]]; then
         log_prefix="log"
     fi
 
-    latest_log=$(find "$LOG_DIR" -maxdepth 1 -name "${log_prefix}_*" 2>/dev/null | grep -E "/${log_prefix}_[0-9]+$" | sort -V | tail -n 1)
+    latest_log=$(find "$LOG_DIR" -maxdepth 1 -name "${log_prefix}_*" 2>/dev/null | grep -E "/${log_prefix}_[0-9]+$" | sort -V | tail -n 1 || true)
     if [[ -z "$latest_log" ]]; then
         next_num=1
     else
@@ -961,24 +1115,21 @@ if [[ "${GENERATE_LOGS,,}" == "true" ]]; then
 fi
 
 # --- 3. Temporary Files ---
-OUTPUT_FILE=$(mktemp) || exit 1
-SYNC_LOG=$(mktemp) || exit 1
-REFL_LOG=$(mktemp) || exit 1
+create_temp_file OUTPUT_FILE "asu_out"
+create_temp_file SYNC_LOG "asu_sync"
+create_temp_file REFL_LOG "asu_refl"
 
-if ! CHECK_DB=$(mktemp -d /tmp/checkupdates-db.XXXXXX); then
-    echo -e "${red}Error: Could not create temp db directory.${reset}"
-    exit 1
-fi
+create_temp_dir CHECK_DB "checkupdates-db"
 chmod 755 "$CHECK_DB"
 
 # --- 4. Helper Functions ---
 get_update_type() {
-    local old=$1
-    local new=$2
-    local level=${3:-3}
+    local old="${1:-}"
+    local new="${2:-}"
+    local level="${3:-3}"
 
-    local v_old=${old#*:}
-    local v_new=${new#*:}
+    local v_old="${old#*:}"
+    local v_new="${new#*:}"
 
     if [[ "$v_new" == "latest-commit" ]]; then
         echo "MINOR"
@@ -986,31 +1137,44 @@ get_update_type() {
     fi
 
     if [[ "$old" == *":"* || "$new" == *":"* ]]; then
-        local e_old=${old%%:*}
-        local e_new=${new%%:*}
-        [[ "$e_old" != "$e_new" ]] && { echo "EPOCH"; return; }
+        local e_old="0"
+        local e_new="0"
+        [[ "$old" == *":"* ]] && e_old="${old%%:*}"
+        [[ "$new" == *":"* ]] && e_new="${new%%:*}"
+        if [[ "$e_old" != "$e_new" ]]; then
+            echo "EPOCH"
+            return
+        fi
     fi
 
     local up_old="${v_old%-*}"
     local up_new="${v_new%-*}"
 
-    local nums_old nums_new
-    read -ra nums_old <<< "${up_old//[^0-9]/ }"
-    read -ra nums_new <<< "${up_new//[^0-9]/ }"
+    local -a segs_old segs_new
+    IFS='.-_' read -ra segs_old <<< "$up_old" || true
+    IFS='.-_' read -ra segs_new <<< "$up_new" || true
 
-    local len=${#nums_new[@]}
+    local len="${#segs_new[@]}"
     local i
     for (( i=0; i<len; i++ )); do
-        local n_old=${nums_old[$i]}
-        local n_new=${nums_new[$i]}
+        local s_old=0
+        if (( i < ${#segs_old[@]} )); then
+            s_old="${segs_old[$i]}"
+        fi
+        local s_new=0
+        if (( i < ${#segs_new[@]} )); then
+            s_new="${segs_new[$i]}"
+        fi
 
-        [[ -z "$n_old" ]] && { echo "MINOR"; return; }
-
-        if (( 10#${n_old:-0} != 10#${n_new:-0} )); then
-            if (( (10#${n_new:-0} >= 2020 && 10#${n_new:-0} <= 2100) || \
-                  (10#${n_new:-0} >= 20200000 && 10#${n_new:-0} <= 21001231) )); then
-                echo "CALVER"
-                return
+        if [[ "$s_new" != "$s_old" ]]; then
+            if [[ "$s_new" =~ ^[0-9]+$ ]]; then
+                if [[ "$s_new" =~ ^[0-9]{4}$ ]] && (( 10#$s_new >= 2020 && 10#$s_new <= 2100 )); then
+                    echo "CALVER"
+                    return
+                elif [[ "$s_new" =~ ^[0-9]{8}$ ]] && (( 10#$s_new >= 20200000 && 10#$s_new <= 21001231 )); then
+                    echo "CALVER"
+                    return
+                fi
             fi
 
             if (( i == 0 )); then
@@ -1034,7 +1198,7 @@ get_update_type() {
 }
 
 get_type_color() {
-    case $1 in
+    case "${1:-}" in
         "MAJOR") echo "$red$bold" ;;
         "CALVER") echo "$blue$bold" ;;
         "MINOR") echo "$cyan" ;;
@@ -1063,7 +1227,7 @@ try:
 except Exception:
     sys.exit(1)
 EOF
-    ); then
+    ) && [[ "$news_ts" =~ ^[0-9]+$ ]]; then
         now_time=$(date +%s)
         diff_hours=$(( (now_time - news_ts) / 3600 ))
 
@@ -1254,7 +1418,7 @@ backup_pacman_db() {
 }
 
 execute_update_task() {
-    local cmd="$1"
+    local cmd="${1:-}"
 
     if [[ "${ASU_TTY_OUT:-}" =~ ^[0-9]+$ ]] && [[ "${ASU_TTY_ERR:-}" =~ ^[0-9]+$ ]] && [ -t "$ASU_TTY_OUT" ] && [ -t 0 ]; then
         if [[ "${GENERATE_LOGS,,}" == "true" && -n "${LOG_FILE:-}" ]]; then
@@ -1288,37 +1452,9 @@ try:
         for line in f:
             line_clean = ansi_escape.sub("", line.rstrip("\r\n"))
             if "\r" in line_clean:
-                parts = line_clean.split("\r")
-                final_parts = []
-                last_p = ""
-                for p in parts:
-                    p_stripped = p.strip()
-                    if not p_stripped:
-                        continue
-                    if last_p:
-                        prefix_len = 0
-                        for c1, c2 in zip(last_p, p):
-                            if c1 == c2:
-                                prefix_len += 1
-                            else:
-                                break
-                        suffix_len = 0
-                        for c1, c2 in zip(reversed(last_p), reversed(p)):
-                            if c1 == c2:
-                                suffix_len += 1
-                            else:
-                                break
-                        if prefix_len >= 3 or suffix_len >= 5 or last_p in p or p in last_p:
-                            last_p = p
-                        else:
-                            final_parts.append(last_p)
-                            last_p = p
-                    else:
-                        last_p = p
-                if last_p:
-                    final_parts.append(last_p)
-                for fp in final_parts:
-                    print(fp)
+                parts = [p.strip() for p in line_clean.split("\r") if p.strip()]
+                if parts:
+                    print(parts[-1])
             else:
                 print(line_clean)
 except BaseException:
@@ -1358,9 +1494,9 @@ check_reboot_needed() {
     boot_ts=$(date -d "$boot_time" +%s 2>/dev/null)
     [[ -z "$boot_ts" ]] && return 0
     
-    local read_cmd=(tail -n 2000 "$log_file")
+    local read_cmd=(tail -n 4000 "$log_file")
     if [[ ! -r "$log_file" ]]; then
-        read_cmd=(sudo tail -n 2000 "$log_file")
+        read_cmd=(sudo tail -n 4000 "$log_file")
     fi
     
     local updated_pkgs
@@ -1418,47 +1554,47 @@ get_current_mirror() {
 launch_detached() {
     if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
         local env_args=()
-        [[ -n "$DISPLAY" ]] && env_args+=("-E" "DISPLAY=$DISPLAY")
-        [[ -n "$WAYLAND_DISPLAY" ]] && env_args+=("-E" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
-        [[ -n "$XAUTHORITY" ]] && env_args+=("-E" "XAUTHORITY=$XAUTHORITY")
-        [[ -n "$XDG_RUNTIME_DIR" ]] && env_args+=("-E" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
-        [[ -n "$DBUS_SESSION_BUS_ADDRESS" ]] && env_args+=("-E" "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
-        [[ -n "$XDG_CURRENT_DESKTOP" ]] && env_args+=("-E" "XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP")
-        [[ -n "$XDG_DATA_DIRS" ]] && env_args+=("-E" "XDG_DATA_DIRS=$XDG_DATA_DIRS")
-        [[ -n "$XDG_CONFIG_DIRS" ]] && env_args+=("-E" "XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
-        [[ -n "$PATH" ]] && env_args+=("-E" "PATH=$PATH")
+        [[ -n "${DISPLAY:-}" ]] && env_args+=("-E" "DISPLAY=$DISPLAY")
+        [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("-E" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+        [[ -n "${XAUTHORITY:-}" ]] && env_args+=("-E" "XAUTHORITY=$XAUTHORITY")
+        [[ -n "${XDG_RUNTIME_DIR:-}" ]] && env_args+=("-E" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+        [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && env_args+=("-E" "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
+        [[ -n "${XDG_CURRENT_DESKTOP:-}" ]] && env_args+=("-E" "XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP")
+        [[ -n "${XDG_DATA_DIRS:-}" ]] && env_args+=("-E" "XDG_DATA_DIRS=$XDG_DATA_DIRS")
+        [[ -n "${XDG_CONFIG_DIRS:-}" ]] && env_args+=("-E" "XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
+        [[ -n "${PATH:-}" ]] && env_args+=("-E" "PATH=$PATH")
 
-        systemd-run --user --quiet --collect "${env_args[@]}" "$@" 2>/dev/null && return
+        systemd-run --user --quiet --collect "${env_args[@]+"${env_args[@]}"}" "$@" 2>/dev/null && return
     fi
 
     local env_cmd=(env)
     local run_dir="${XDG_RUNTIME_DIR:-/run/user/$EUID}"
     env_cmd+=("XDG_RUNTIME_DIR=$run_dir")
     env_cmd+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$run_dir/bus}")
-    [[ -n "$PATH" ]] && env_cmd+=("PATH=$PATH")
-    [[ -n "$XAUTHORITY" ]] && env_cmd+=("XAUTHORITY=$XAUTHORITY")
-    [[ -n "$XDG_DATA_DIRS" ]] && env_cmd+=("XDG_DATA_DIRS=$XDG_DATA_DIRS")
-    [[ -n "$XDG_CONFIG_DIRS" ]] && env_cmd+=("XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
+    [[ -n "${PATH:-}" ]] && env_cmd+=("PATH=$PATH")
+    [[ -n "${XAUTHORITY:-}" ]] && env_cmd+=("XAUTHORITY=$XAUTHORITY")
+    [[ -n "${XDG_DATA_DIRS:-}" ]] && env_cmd+=("XDG_DATA_DIRS=$XDG_DATA_DIRS")
+    [[ -n "${XDG_CONFIG_DIRS:-}" ]] && env_cmd+=("XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
 
-    if [[ -z "$WAYLAND_DISPLAY" ]] && [[ -d "$run_dir" ]]; then
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]] && [[ -d "$run_dir" ]]; then
         for sock in "$run_dir"/wayland-[0-9]*; do
             if [[ -S "$sock" ]]; then
                 env_cmd+=("WAYLAND_DISPLAY=$(basename "$sock")")
                 break
             fi
         done
-    elif [[ -n "$WAYLAND_DISPLAY" ]]; then
+    elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
         env_cmd+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
     fi
 
-    if [[ -z "$DISPLAY" ]]; then
+    if [[ -z "${DISPLAY:-}" ]]; then
         for sock in /tmp/.X11-unix/X[0-9]*; do
             if [[ -S "$sock" ]]; then
                 env_cmd+=("DISPLAY=:${sock#/tmp/.X11-unix/X}")
                 break
             fi
         done
-    elif [[ -n "$DISPLAY" ]]; then
+    elif [[ -n "${DISPLAY:-}" ]]; then
         env_cmd+=("DISPLAY=$DISPLAY")
     fi
 
@@ -1615,10 +1751,15 @@ refresh_mirrors() {
 
 handle_daemon_sync_fail() {
     if [[ "$DAEMON_MODE" == true ]]; then
+        local lock_file="$CONFIG_DIR/.state.lock"
+        local lock_fd=""
+        if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+            flock -x "$lock_fd"
+        fi
         local count_file="$CONFIG_DIR/sync_failures.count"
         local count=0
         if [[ -f "$count_file" ]]; then
-            count=$(cat "$count_file" 2>/dev/null)
+            count=$(cat "$count_file" 2>/dev/null || echo 0)
         fi
         if [[ ! "$count" =~ ^[0-9]+$ ]]; then
             count=0
@@ -1633,12 +1774,23 @@ handle_daemon_sync_fail() {
                     "Connection Warning" "Failed to connect to mirrors 3 times consecutively."
             fi
         fi
+        if [[ -n "${lock_fd:-}" ]]; then
+            exec {lock_fd}<&-
+        fi
     fi
 }
 
 handle_daemon_sync_success() {
     if [[ "$DAEMON_MODE" == true ]]; then
+        local lock_file="$CONFIG_DIR/.state.lock"
+        local lock_fd=""
+        if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+            flock -x "$lock_fd"
+        fi
         rm -f "$CONFIG_DIR/sync_failures.count"
+        if [[ -n "${lock_fd:-}" ]]; then
+            exec {lock_fd}<&-
+        fi
     fi
 }
 
@@ -1883,23 +2035,23 @@ fi
 
 log_step "Calculating update list (pacman -Qu)..."
 
-ignored_pkgs=$(pacman-conf IgnorePkg 2>/dev/null | tr ' ' '\n')
-ignored_groups=$(pacman-conf IgnoreGroup 2>/dev/null | tr ' ' '\n')
+ignored_pkgs=$(pacman-conf IgnorePkg 2>/dev/null | tr ' ' '\n' || true)
+ignored_groups=$(pacman-conf IgnoreGroup 2>/dev/null | tr ' ' '\n' || true)
 
 if [[ -n "$ignored_groups" ]]; then
-    group_pkgs=$(echo "$ignored_groups" | xargs -r pacman -Sgq 2>/dev/null)
+    group_pkgs=$(echo "$ignored_groups" | xargs -r pacman -Sgq 2>/dev/null || true)
     ignored_pkgs="$ignored_pkgs"$'\n'"$group_pkgs"
 fi
 
-ignored_pkgs=$(echo "$ignored_pkgs" | sed '/^$/d' | sort -u)
+ignored_pkgs=$(echo "$ignored_pkgs" | sed '/^$/d' | sort -u || true)
 
-repo_updates=$(LC_ALL=C pacman -Qu --dbpath "$CHECK_DB" --color never)
+repo_updates=$(LC_ALL=C pacman -Qu --dbpath "$CHECK_DB" --color never || true)
 
 aur_updates=""
 if [[ -n "$AUR_HELPER" ]]; then
-    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
+    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}' || true)
     if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
-        if aur_raw=$("${HELPER_CMD[@]}" -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null); then
+        if aur_raw=$("${HELPER_CMD[@]}" -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null) && [[ -n "$aur_raw" ]]; then
             aur_updates="$aur_raw"
         fi
     else
@@ -1935,11 +2087,11 @@ ignored_updates=""
 if [[ -n "$ignored_pkgs" ]]; then
     awk_base='BEGIN { split(ig, a, "\n"); for (i in a) if(a[i] != "") ign[a[i]]=1 }'
 
-    all_raw_updates=$(printf "%s\n%s" "$repo_updates" "$aur_updates" | sed '/^$/d')
-    ignored_updates=$(echo "$all_raw_updates" | awk -v ig="$ignored_pkgs" "$awk_base ign[\$1]")
+    all_raw_updates=$(printf "%s\n%s" "$repo_updates" "$aur_updates" | sed '/^$/d' || true)
+    ignored_updates=$(echo "$all_raw_updates" | awk -v ig="$ignored_pkgs" "$awk_base ign[\$1]" || true)
 
-    [[ -n "$repo_updates" ]] && repo_updates=$(echo "$repo_updates" | awk -v ig="$ignored_pkgs" "$awk_base !ign[\$1]")
-    [[ -n "$aur_updates" ]]  && aur_updates=$(echo "$aur_updates" | awk -v ig="$ignored_pkgs" "$awk_base !ign[\$1]")
+    [[ -n "$repo_updates" ]] && repo_updates=$(echo "$repo_updates" | awk -v ig="$ignored_pkgs" "$awk_base !ign[\$1]" || true)
+    [[ -n "$aur_updates" ]]  && aur_updates=$(echo "$aur_updates" | awk -v ig="$ignored_pkgs" "$awk_base !ign[\$1]" || true)
 fi
 
 repo_pkgs=""
@@ -1956,20 +2108,29 @@ if [[ -z "$updates" ]]; then
     echo -e "${green}System is fully up to date.${reset}\n"
 
     if [[ -n "$ignored_updates" ]]; then
-        echo -e "${magenta}${bold}Skipped Packages (IgnorePkg / IgnoreGroup):${reset}"
         while read -r pkg old_ver _ new_ver rest; do
             echo -e "${dim}- ${pkg}: ${gray}${old_ver}${reset} ${blue}→${reset} ${white}${new_ver}${reset}"
         done <<< "$ignored_updates"
         echo ""
     fi
 
-    rm -f "$CONFIG_DIR/next_check.conf"
-    sync_daemon_state >/dev/null 2>&1
-
-    if [[ "$DAEMON_MODE" == true ]]; then
-        rm -f "$CONFIG_DIR/updates.cache"
+    lock_file="$CONFIG_DIR/.state.lock"
+    lock_fd=""
+    if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+        flock -x "$lock_fd"
+        rm -f "$CONFIG_DIR/next_check.conf"
+        if [[ "$DAEMON_MODE" == true ]]; then
+            rm -f "$CONFIG_DIR/updates.cache"
+        fi
+        exec {lock_fd}<&-
+    else
+        rm -f "$CONFIG_DIR/next_check.conf"
+        if [[ "$DAEMON_MODE" == true ]]; then
+            rm -f "$CONFIG_DIR/updates.cache"
+        fi
     fi
 
+    sync_daemon_state >/dev/null 2>&1
     exit 0
 fi
 
@@ -2069,7 +2230,7 @@ fi
 log_step "Fetching local metadata (pacman -Qi)..."
 declare -A OLD_DATA
 while IFS='|' read -r name bdate reason; do
-    [[ -z "${OLD_DATA[$name]}" ]] && OLD_DATA["$name"]="$bdate|$reason"
+    [[ -z "${OLD_DATA[$name]:-}" ]] && OLD_DATA["$name"]="$bdate|$reason"
 done < <(echo "$all_pkgs" | xargs -r env LC_ALL=C pacman -Qi 2>/dev/null | awk '
     /^Name[ \t]*:/ {n=$0; sub(/^[^:]*:[ \t]*/, "", n)}
     /^Build Date[ \t]*:/ {b=$0; sub(/^[^:]*:[ \t]*/, "", b)}
@@ -2112,8 +2273,8 @@ while read -r pkgname old_ver _ new_ver _rest; do
         fi
     fi
 
-    IFS='|' read -r repo date_new size desc <<< "${NEW_DATA[$pkgname]}"
-    IFS='|' read -r _ reason <<< "${OLD_DATA[$pkgname]}"
+    IFS='|' read -r repo date_new size desc <<< "${NEW_DATA[$pkgname]:-}"
+    IFS='|' read -r _ reason <<< "${OLD_DATA[$pkgname]:-}"
 
     is_explicit=0
     [[ "$reason" == *"Explicitly"* ]] && is_explicit=1
@@ -2129,11 +2290,11 @@ while read -r pkgname old_ver _ new_ver _rest; do
     diff_hours=9999
 
     if [[ -n "$date_new" && "$date_new" != "N/A" ]]; then
-        if [[ -z "${DATE_CACHE["$date_new"]}" ]]; then
+        if [[ -z "${DATE_CACHE["$date_new"]:-}" ]]; then
             DATE_CACHE["$date_new"]=$(LC_TIME=C date -d "$date_new" +'%s|%d %b %H:%M' 2>/dev/null || echo "0|")
         fi
 
-        IFS='|' read -r epoch_new fmt_date_new <<< "${DATE_CACHE["$date_new"]}"
+        IFS='|' read -r epoch_new fmt_date_new <<< "${DATE_CACHE["$date_new"]:-}"
 
         if [[ -n "$epoch_new" ]] && (( epoch_new > 0 )); then
             diff_hours=$(( (now - epoch_new) / 3600 ))
@@ -2144,9 +2305,9 @@ while read -r pkgname old_ver _ new_ver _rest; do
     is_crit=0
     is_feat=0
 
-    [[ ${NUKE_MAP["$pkgname"]} ]] && is_nuke=1
-    [[ ${CRIT_MAP["$pkgname"]} ]] && is_crit=1
-    [[ ${FEAT_MAP["$pkgname"]} ]] && is_feat=1
+    [[ ${NUKE_MAP["$pkgname"]:-} ]] && is_nuke=1
+    [[ ${CRIT_MAP["$pkgname"]:-} ]] && is_crit=1
+    [[ ${FEAT_MAP["$pkgname"]:-} ]] && is_feat=1
 
     if (( is_nuke )); then
         pkg_level=0
@@ -2346,6 +2507,8 @@ give_advice() {
 
     local DE_PATTERN="^(plasma-|gnome-|hyprland|kwin|mutter|cinnamon|xfce4|qt[56]-|gtk[34]|kf[56]-|frameworkintegration)"
 
+    local pkg_level="" upd_type="" pkgname="" repo="" epoch_new="0"
+
     while IFS=$'\t' read -r _ _ pkg_level upd_type pkgname _ _ repo _ _ epoch_new _ _; do
         [[ "${repo,,}" == "aur" ]] && continue
 
@@ -2464,15 +2627,20 @@ give_advice() {
 
     printf '%bADVISOR:%b ' "$bold" "$reset"
 
+    local lock_file="$CONFIG_DIR/.state.lock"
+    local lock_fd=""
+    if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+        flock -x "$lock_fd"
+    fi
+
     if (( max_wait_sec == 0 )); then
         echo -e "${green}${bold}GO FOR IT!${reset} ${dim}(Packages have stabilized. Mirrors synced.)${reset}"
         GLOBAL_ADVISOR_SAFE=true
 
         rm -f "$CONFIG_DIR/next_check.conf"
-        sync_daemon_state >/dev/null 2>&1
     else
         local target_time
-        target_time=$(date -d "@$(( now + max_wait_sec ))" +%H:%M)
+        target_time=$(date -d "@$(( now + max_wait_sec ))" +%H:%M || echo "00:00")
 
         local wait_h=$(( max_wait_sec / 3600 ))
         local wait_m=$(( (max_wait_sec % 3600) / 60 ))
@@ -2495,8 +2663,13 @@ give_advice() {
 
         rm -f "$CONFIG_DIR/next_check.conf"
         echo "$(( now + max_wait_sec ))" > "$CONFIG_DIR/next_check.conf"
-        sync_daemon_state >/dev/null 2>&1
     fi
+
+    if [[ -n "${lock_fd:-}" ]]; then
+        exec {lock_fd}<&-
+    fi
+
+    sync_daemon_state >/dev/null 2>&1
     echo -e "${dim}---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------${reset}"
 }
 
@@ -2525,24 +2698,36 @@ if [[ "$DAEMON_MODE" == true ]]; then
     CACHE_FILE="$CONFIG_DIR/updates.cache"
 
     if [[ "$GLOBAL_ADVISOR_SAFE" == true ]] && (( pkg_count > 0 )) && command -v notify-send >/dev/null 2>&1; then
+        lock_file="$CONFIG_DIR/.state.lock"
+        lock_fd=""
+        if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+            flock -x "$lock_fd"
+        fi
         OLD_COUNT=0
-        [[ -f "$CACHE_FILE" ]] && OLD_COUNT=$(cat "$CACHE_FILE" 2>/dev/null)
-
+        should_notify=false
+        if [[ -f "$CACHE_FILE" ]]; then
+            OLD_COUNT=$(cat "$CACHE_FILE" 2>/dev/null || echo 0)
+        fi
         [[ ! "$OLD_COUNT" =~ ^[0-9]+$ ]] && OLD_COUNT=0
-
         if (( pkg_count != OLD_COUNT )); then
-            notif_icon="software-update-available"
-            [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
-
             rm -f "$CACHE_FILE"
             echo "$pkg_count" > "$CACHE_FILE"
+            should_notify=true
+        fi
+        if [[ -n "${lock_fd:-}" ]]; then
+            exec {lock_fd}<&-
+        fi
+
+        if [[ "$should_notify" == "true" ]]; then
+            notif_icon="software-update-available"
+            [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
 
             if notify-send --help 2>&1 | grep -q -- "--action"; then
                 TMP_NOTIFY=$(mktemp --suffix=.sh "${XDG_RUNTIME_DIR:-/tmp}/asu_update.XXXXXX")
                 terminal_esc=$(printf '%q' "${TERMINAL:-}")
                 config_dir_esc=$(printf '%q' "${CONFIG_DIR}")
                 silence_updates_esc=$(printf '%q' "${SILENCE_UPDATES}")
-                script_bin_esc=$(printf '%q' "${SCRIPT_BIN:-$(realpath "$(command -v "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "${BASH_SOURCE[0]:-$0}")")}")
+                script_bin_esc=$(printf '%q' "${SCRIPT_BIN:-$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")")}")
                 main_notif_icon="software-update-available"
                 [[ -f "$ICON_PATH" ]] && main_notif_icon="$ICON_PATH"
                 cat <<EOF > "$TMP_NOTIFY"
@@ -2633,14 +2818,14 @@ fi
 check_pending_updates() {
     local check_mode="${1:-all}"
     local pending
-    pending=$(LC_ALL=C pacman -Qu 2>/dev/null)
+    pending=$(LC_ALL=C pacman -Qu 2>/dev/null || true)
 
     if [[ "$check_mode" != "repo_only" && -n "$AUR_HELPER" ]]; then
         local helper_bin
-        helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
+        helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}' || true)
         if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
             local aur_pending
-            aur_pending=$("${HELPER_CMD[@]}" -Qua --color never 2>/dev/null)
+            aur_pending=$("${HELPER_CMD[@]}" -Qua --color never 2>/dev/null || true)
 
             if [[ -n "$aur_pending" ]]; then
                 if [[ -n "$pending" ]]; then
@@ -2685,8 +2870,8 @@ except Exception: pass' 2>/dev/null)
         fi
     fi
 
-    if [[ -n "$ignored_pkgs" && -n "$pending" ]]; then
-        pending=$(echo "$pending" | awk -v ig="$ignored_pkgs" '
+    if [[ -n "${ignored_pkgs:-}" && -n "$pending" ]]; then
+        pending=$(echo "$pending" | awk -v ig="${ignored_pkgs:-}" '
             BEGIN { split(ig, a, "\n"); for (i in a) if(a[i] != "") ign[a[i]]=1 }
             { if (!ign[$1]) print $0 }
         ')
@@ -2818,7 +3003,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         if [[ -n "$BEST_UPDATE_TOOL" && "$HAS_TOPGRADE" == "true" ]]; then
             tool_name="$BEST_UPDATE_TOOL"
 
-            echo -e "${blue}${bold}Running $tool_name (Keyrings & Packages)...${reset}\n"
+            echo -e "${blue}${bold}Running $tool_name (Keyrings & Packages)...${reset}"
             execute_update_task "$tool_name"
             core_exit=$?
 
@@ -2929,8 +3114,16 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
     fi
 
     if $UPDATE_SUCCESS; then
+        lock_file="$CONFIG_DIR/.state.lock"
+        lock_fd=""
+        if touch "$lock_file" 2>/dev/null && exec {lock_fd}<"$lock_file" 2>/dev/null; then
+            flock -x "$lock_fd"
+        fi
         rm -f "$CONFIG_DIR/updates.cache"
         rm -f "$CONFIG_DIR/next_check.conf"
+        if [[ -n "${lock_fd:-}" ]]; then
+            exec {lock_fd}<&-
+        fi
 
         if [[ "${ENABLE_BACKGROUND_CHECK,,}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
             sync_daemon_state >/dev/null 2>&1
@@ -2971,7 +3164,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             done
 
             cleaned_aur="false"
-            for h in "${helpers_to_clean[@]}"; do
+            for h in "${helpers_to_clean[@]+"${helpers_to_clean[@]}"}"; do
                 if [[ -d "$USER_HOME/.cache/$h" ]]; then
                     if [[ "$cleaned_aur" == "false" ]]; then
                         echo -e "${dim}Clearing AUR helper build caches...${reset}"
