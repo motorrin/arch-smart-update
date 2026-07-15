@@ -45,7 +45,6 @@ The script also supports distribution-specific utilities on **EndeavourOS** (suc
 - **🧹 Automated System Cleanup:** Optional post-update cleanup that safely removes orphaned packages, clears partial downloads, empties the pacman/AUR cache, vacuums the systemd journal (keeping 100M), and clears user thumbnail caches.
 - **🧩 Seamless Ecosystem Integration:** Full, native support for AUR helpers (`yay`, `paru`), as well as synergy with `eos-update` and `topgrade` to handle your Flatpaks, firmwares, and dotfiles.
 - **👻 Background Daemon & Notifications:** You can allow the script to run in the background using a user systemd timer. It silently checks for updates using `fakeroot` (no sudo required) and sends interactive desktop notifications via `libnotify`. Features a smart 3-notification limit for Arch News to prevent spam.
-- **🎛️ Unified Configuration Management:** All custom commands, mirror overrides, behavior settings, and user package arrays are securely parsed from a single `settings.conf` file. Your personal settings are isolated from upstream defaults and will never be overwritten during script updates.
 
 ---
 
@@ -88,7 +87,7 @@ Whenever the master configuration on GitHub is updated, the script will quietly 
 
 The script relies on standard system utilities, but make sure you have the following packages installed:
 
-`sudo pacman -S curl python bash tar gawk coreutils zstd util-linux`
+`sudo pacman -S curl python bash tar gawk coreutils zstd grep sed`
 
 *(Note: The python package provides python3 for the Arch News RSS check, zstd is required for accelerated local database backups, and util-linux provides the script utility used for interactive terminal emulation).*
 
