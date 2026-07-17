@@ -73,6 +73,56 @@ create_temp_dir() {
     eval "$var_name=\$tmp"
 }
 
+launch_detached() {
+    if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
+        local env_args=()
+        [[ -n "${DISPLAY:-}" ]] && env_args+=("-E" "DISPLAY=$DISPLAY")
+        [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("-E" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+        [[ -n "${XAUTHORITY:-}" ]] && env_args+=("-E" "XAUTHORITY=$XAUTHORITY")
+        [[ -n "${XDG_RUNTIME_DIR:-}" ]] && env_args+=("-E" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
+        [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && env_args+=("-E" "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
+        [[ -n "${XDG_CURRENT_DESKTOP:-}" ]] && env_args+=("-E" "XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP")
+        [[ -n "${XDG_DATA_DIRS:-}" ]] && env_args+=("-E" "XDG_DATA_DIRS=$XDG_DATA_DIRS")
+        [[ -n "${XDG_CONFIG_DIRS:-}" ]] && env_args+=("-E" "XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
+        [[ -n "${PATH:-}" ]] && env_args+=("-E" "PATH=$PATH")
+        systemd-run --user --quiet --collect "${env_args[@]+"${env_args[@]}"}" "$@" 2>/dev/null && return
+    fi
+    local env_cmd=(env)
+    local run_dir="${XDG_RUNTIME_DIR:-/run/user/$EUID}"
+    env_cmd+=("XDG_RUNTIME_DIR=$run_dir")
+    env_cmd+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$run_dir/bus}")
+    [[ -n "${PATH:-}" ]] && env_cmd+=("PATH=$PATH")
+    [[ -n "${XAUTHORITY:-}" ]] && env_cmd+=("XAUTHORITY=$XAUTHORITY")
+    [[ -n "${XDG_DATA_DIRS:-}" ]] && env_cmd+=("XDG_DATA_DIRS=$XDG_DATA_DIRS")
+    [[ -n "${XDG_CONFIG_DIRS:-}" ]] && env_cmd+=("XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]] && [[ -d "$run_dir" ]]; then
+        for sock in "$run_dir"/wayland-[0-9]*; do
+            if [[ -S "$sock" ]]; then
+                env_cmd+=("WAYLAND_DISPLAY=$(basename "$sock")")
+                break
+            fi
+        done
+    elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+        env_cmd+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
+    fi
+    if [[ -z "${DISPLAY:-}" ]]; then
+        for sock in /tmp/.X11-unix/X[0-9]*; do
+            if [[ -S "$sock" ]]; then
+                env_cmd+=("DISPLAY=:${sock#/tmp/.X11-unix/X}")
+                break
+            fi
+        done
+    elif [[ -n "${DISPLAY:-}" ]]; then
+        env_cmd+=("DISPLAY=$DISPLAY")
+    fi
+    if command -v setsid >/dev/null 2>&1; then
+        "${env_cmd[@]}" setsid -f "$@" </dev/null >/dev/null 2>&1
+    else
+        "${env_cmd[@]}" nohup "$@" </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+}
+
 if ! $DAEMON_MODE && [ -d "$CONFIG_DIR" ]; then
     dir_owner=$(stat -Lc '%u' "$CONFIG_DIR" 2>/dev/null || echo "")
     if [[ "$dir_owner" == "0" ]] || find "$CONFIG_DIR" -user root -print -quit 2>/dev/null | grep -q .; then
@@ -725,8 +775,10 @@ if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
     if [[ "$daemon_ans" =~ ^[Yy]$ ]]; then
         sed -i 's/^ENABLE_BACKGROUND_CHECK=.*/ENABLE_BACKGROUND_CHECK=true/' "$SETTINGS_CONF"
         echo -e "${dim}Background checker enabled.${reset}"
+        echo -e "${yellow}Note: If CUSTOM_CMDS is active in settings.conf, making any subsequent${reset}"
+        echo -e "${yellow}changes to your settings file requires running this script manually once.${reset}"
         if ! pacman -Q libnotify >/dev/null 2>&1; then
-            echo -e "${yellow}Warning: The ${red}libnotify${yellow} package is not installed. Please install it for notifications to work.${reset}\n"
+            echo -e "\n${yellow}Warning: The ${red}libnotify${yellow} package is not installed. Please install it for notifications to work.${reset}\n"
         else
             echo ""
         fi
@@ -752,9 +804,11 @@ if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
     fi
 fi
 
+SETTINGS_VALIDATION_FAILED=false
 if ! validate_user_conf "$SETTINGS_CONF" "settings.conf"; then
     echo -e "${yellow}Settings disabled due to security check failure.${reset}"
     SETTINGS_CONF=""
+    SETTINGS_VALIDATION_FAILED=true
 fi
 
 if ! validate_user_conf "$PKG_CONF" "packages.conf"; then
@@ -855,6 +909,10 @@ declare -A FEAT_MAP
 for pkg in "${FEATURE_PKGS[@]+"${FEATURE_PKGS[@]}"}"; do FEAT_MAP["$pkg"]=1; done
 
 sync_daemon_state() {
+    if [[ "${SETTINGS_VALIDATION_FAILED:-false}" == "true" ]]; then
+        return 0
+    fi
+
     local QUIET=false
     [[ "$DAEMON_MODE" == true ]] && QUIET=true
 
@@ -1044,6 +1102,16 @@ if [[ "$DAEMON_MODE" == true ]]; then
     desktop_env="${XDG_CURRENT_DESKTOP:-}"
     if [[ "${session_type,,}" == "x11" ]] || [[ "${desktop_env,,}" =~ (xfce|lxqt|mate|cinnamon|i3) ]]; then
         unset WAYLAND_DISPLAY
+    fi
+
+    if [[ "${SETTINGS_VALIDATION_FAILED:-false}" == "true" ]]; then
+        log_step "Error: settings.conf failed verification. Aborting."
+        if command -v notify-send >/dev/null 2>&1; then
+            notif_icon="dialog-error"
+            [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
+            launch_detached notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" "Security Alert: Background Monitor Paused" "Unverified changes detected in settings.conf. Please run this script manually in a terminal to authorize them."
+        fi
+        exit 1
     fi
 
     NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
@@ -1550,62 +1618,6 @@ get_current_mirror() {
     local mirror
     mirror=$(awk -F/ '/^Server[ \t]*=/ {print $3; exit}' /etc/pacman.d/mirrorlist 2>/dev/null)
     echo "${mirror:-Unknown}"
-}
-
-# shellcheck disable=SC2329
-launch_detached() {
-    if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
-        local env_args=()
-        [[ -n "${DISPLAY:-}" ]] && env_args+=("-E" "DISPLAY=$DISPLAY")
-        [[ -n "${WAYLAND_DISPLAY:-}" ]] && env_args+=("-E" "WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
-        [[ -n "${XAUTHORITY:-}" ]] && env_args+=("-E" "XAUTHORITY=$XAUTHORITY")
-        [[ -n "${XDG_RUNTIME_DIR:-}" ]] && env_args+=("-E" "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR")
-        [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && env_args+=("-E" "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS")
-        [[ -n "${XDG_CURRENT_DESKTOP:-}" ]] && env_args+=("-E" "XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP")
-        [[ -n "${XDG_DATA_DIRS:-}" ]] && env_args+=("-E" "XDG_DATA_DIRS=$XDG_DATA_DIRS")
-        [[ -n "${XDG_CONFIG_DIRS:-}" ]] && env_args+=("-E" "XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
-        [[ -n "${PATH:-}" ]] && env_args+=("-E" "PATH=$PATH")
-
-        systemd-run --user --quiet --collect "${env_args[@]+"${env_args[@]}"}" "$@" 2>/dev/null && return
-    fi
-
-    local env_cmd=(env)
-    local run_dir="${XDG_RUNTIME_DIR:-/run/user/$EUID}"
-    env_cmd+=("XDG_RUNTIME_DIR=$run_dir")
-    env_cmd+=("DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-unix:path=$run_dir/bus}")
-    [[ -n "${PATH:-}" ]] && env_cmd+=("PATH=$PATH")
-    [[ -n "${XAUTHORITY:-}" ]] && env_cmd+=("XAUTHORITY=$XAUTHORITY")
-    [[ -n "${XDG_DATA_DIRS:-}" ]] && env_cmd+=("XDG_DATA_DIRS=$XDG_DATA_DIRS")
-    [[ -n "${XDG_CONFIG_DIRS:-}" ]] && env_cmd+=("XDG_CONFIG_DIRS=$XDG_CONFIG_DIRS")
-
-    if [[ -z "${WAYLAND_DISPLAY:-}" ]] && [[ -d "$run_dir" ]]; then
-        for sock in "$run_dir"/wayland-[0-9]*; do
-            if [[ -S "$sock" ]]; then
-                env_cmd+=("WAYLAND_DISPLAY=$(basename "$sock")")
-                break
-            fi
-        done
-    elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-        env_cmd+=("WAYLAND_DISPLAY=$WAYLAND_DISPLAY")
-    fi
-
-    if [[ -z "${DISPLAY:-}" ]]; then
-        for sock in /tmp/.X11-unix/X[0-9]*; do
-            if [[ -S "$sock" ]]; then
-                env_cmd+=("DISPLAY=:${sock#/tmp/.X11-unix/X}")
-                break
-            fi
-        done
-    elif [[ -n "${DISPLAY:-}" ]]; then
-        env_cmd+=("DISPLAY=$DISPLAY")
-    fi
-
-    if command -v setsid >/dev/null 2>&1; then
-        "${env_cmd[@]}" setsid -f "$@" </dev/null >/dev/null 2>&1
-    else
-        "${env_cmd[@]}" nohup "$@" </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
-    fi
 }
 
 refresh_mirrors() {
