@@ -204,6 +204,28 @@ prompt_user() {
     [[ -n "$user_input" ]] && declare -g "$var_name=$user_input"
 }
 
+bypass_cdn_cache() {
+    local url="${1:-}"
+    local ts="${EPOCHSECONDS:-}"
+    if [[ -z "$ts" ]]; then
+        ts=$(date +%s 2>/dev/null || echo "1")
+    fi
+    if [[ "$url" == *"raw.githubusercontent.com"* ]]; then
+        local url_no_anchor="${url%%[#]*}"
+        local anchor=""
+        if [[ "$url" == *"#"* ]]; then
+            anchor="#${url#*#}"
+        fi
+        if [[ "$url_no_anchor" == *"?"* ]]; then
+            printf '%s\n' "${url_no_anchor}&t=${ts}${anchor}"
+        else
+            printf '%s\n' "${url_no_anchor}?t=${ts}${anchor}"
+        fi
+    else
+        printf '%s\n' "$url"
+    fi
+}
+
 update_from_github() {
     local file_path="${1:-}"
     local url="${2:-}"
@@ -219,7 +241,10 @@ update_from_github() {
         max_time=10
     fi
 
-    if curl -sLfo "$tmp_file" --connect-timeout "$conn_timeout" --max-time "$max_time" "$url"; then
+    local target_url
+    target_url=$(bypass_cdn_cache "$url")
+
+    if curl -sLfo "$tmp_file" --connect-timeout "$conn_timeout" --max-time "$max_time" "$target_url"; then
         if [[ -n "$expected_string" ]] && ! grep -q "$expected_string" "$tmp_file"; then
             rm -f "$tmp_file"
             [[ ! -f "$file_path" ]] && echo -e "${red}Failed to download $filename (Invalid format / Captive Portal)${reset}"
@@ -229,7 +254,9 @@ update_from_github() {
         local manifest_file="$CONFIG_DIR/manifest.sha256"
         if [[ -f "$manifest_file" ]]; then
             local remote_name
-            remote_name=$(basename "$url")
+            local url_clean="${url%%[?]*}"
+            url_clean="${url_clean%%[#]*}"
+            remote_name=$(basename "$url_clean")
             local expected_hash
             expected_hash=$(awk -v fname="$remote_name" '{sub(/\r$/, ""); sub(/^\*/, "", $2); sub(/^.*\//, "", $2); if ($2 == fname) print $1}' "$manifest_file" 2>/dev/null || true)
             if [[ -n "$expected_hash" ]]; then
@@ -289,7 +316,9 @@ if [[ "${1:-}" == "--reconfigure" ]]; then
             if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
                 MANIFEST_TMP=""
                 create_temp_file MANIFEST_TMP "manifest"
-                if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"; then
+                manifest_url="https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"
+                manifest_target=$(bypass_cdn_cache "$manifest_url")
+                if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "$manifest_target"; then
                     if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$MANIFEST_TMP"; then
                         mv "$MANIFEST_TMP" "$CONFIG_DIR/manifest.sha256"
                         MANIFEST_TMP=""
@@ -714,7 +743,9 @@ echo -e "${dim}Checking for configuration updates...${reset}"
 if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
     manifest_updated=false
     create_temp_file MANIFEST_TMP "manifest"
-    if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"; then
+    manifest_url="https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"
+    manifest_target=$(bypass_cdn_cache "$manifest_url")
+    if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "$manifest_target"; then
         if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$MANIFEST_TMP"; then
             mv "$MANIFEST_TMP" "$CONFIG_DIR/manifest.sha256"
             MANIFEST_TMP=""
