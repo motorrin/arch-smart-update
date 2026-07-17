@@ -1211,6 +1211,7 @@ check_arch_news() {
     log_step "Starting Arch News check (Python)..."
     echo -ne "${gray}Checking Arch News...${reset}"
 
+    local news_ts now_time diff_hours
     if news_ts=$(python3 <<'EOF' 2>/dev/null
 import sys, urllib.request, xml.etree.ElementTree as ET, email.utils
 try:
@@ -1410,6 +1411,7 @@ backup_pacman_db() {
     else
         echo -e "${red}Failed to create backup!${reset}"
         echo -ne "${yellow}Continue anyway? [y/N]: ${reset}"
+        local cont
         read -r cont
         if [[ ! "$cont" =~ ^[Yy]$ ]]; then
             exit 1
@@ -1616,6 +1618,7 @@ refresh_mirrors() {
     local current_mirror
     current_mirror=$(get_current_mirror)
     local mirror_age="Unknown"
+    local ans refl_res new_mirror
 
     if [[ -f "$mirror_list" ]]; then
         local file_ts
@@ -1624,13 +1627,14 @@ refresh_mirrors() {
             local now_ts
             now_ts=$(date +%s)
             local diff_sec=$((now_ts - file_ts))
+            local diff_days diff_hours diff_mins
 
             if (( diff_sec < 0 )); then
                 mirror_age="just now"
             else
-                local diff_days=$((diff_sec / 86400))
-                local diff_hours=$(( (diff_sec % 86400) / 3600 ))
-                local diff_mins=$(( (diff_sec % 3600) / 60 ))
+                diff_days=$((diff_sec / 86400))
+                diff_hours=$(( (diff_sec % 86400) / 3600 ))
+                diff_mins=$(( (diff_sec % 3600) / 60 ))
                 if (( diff_days > 0 )); then
                     mirror_age="${diff_days}d ${diff_hours}h ago"
                 elif (( diff_hours > 0 )); then
@@ -1708,9 +1712,8 @@ refresh_mirrors() {
                 if [[ -n "$CUSTOM_REFLECTOR" ]]; then
                     echo -e "${dim}Executing custom reflector command...${reset}"
                     run_refl_and_check "$CUSTOM_REFLECTOR"
-                    local refl_res=$?
+                    refl_res=$?
                     if [[ $refl_res -eq 0 ]]; then
-                        local new_mirror
                         new_mirror=$(get_current_mirror)
                         echo -e "${green}Custom Arch mirrors updated successfully. New mirror: ${white}$new_mirror${reset}\n"
                         REFL_SUCCESS=true
@@ -1725,9 +1728,8 @@ refresh_mirrors() {
                 if ! $REFL_SUCCESS; then
                     echo -e "${dim}Ranking mirrors... WARNINGS are expected.${reset}"
                     run_refl_and_check "$DEFAULT_REFLECTOR"
-                    local refl_res=$?
+                    refl_res=$?
                     if [[ $refl_res -eq 0 ]]; then
-                        local new_mirror
                         new_mirror=$(get_current_mirror)
                         echo -e "${green}Arch mirrors updated successfully. New mirror: ${white}$new_mirror${reset}\n"
                         return 0
@@ -1812,13 +1814,16 @@ if ! $DAEMON_MODE; then
 fi
 
 AUR_HELPER=""
+HELPER_BIN=""
 if [[ -n "${AUR_HELPER_OVERRIDE:-}" ]]; then
-    helper_bin=$(echo "$AUR_HELPER_OVERRIDE" | awk '{print $1}')
-    if command -v "$helper_bin" &>/dev/null; then
+    check_bin=""
+    read -r check_bin _ <<< "$AUR_HELPER_OVERRIDE" || true
+    if [[ -n "$check_bin" ]] && command -v "$check_bin" &>/dev/null; then
         AUR_HELPER="$AUR_HELPER_OVERRIDE"
     else
-        echo -e "${yellow}Warning: Override AUR helper '$helper_bin' not found. Falling back to auto-detect.${reset}"
+        echo -e "${yellow}Warning: Override AUR helper '$check_bin' not found. Falling back to auto-detect.${reset}"
     fi
+    unset check_bin
 fi
 
 if [[ -z "$AUR_HELPER" ]]; then
@@ -1831,10 +1836,9 @@ if [[ -z "$AUR_HELPER" ]]; then
 fi
 
 declare -a HELPER_CMD=()
-helper_bin=""
 if [[ -n "$AUR_HELPER" ]]; then
     read -ra HELPER_CMD <<< "$AUR_HELPER"
-    helper_bin="${HELPER_CMD[0]}"
+    HELPER_BIN="${HELPER_CMD[0]}"
 fi
 
 if [[ "$DAEMON_MODE" == "false" ]]; then
@@ -2049,8 +2053,7 @@ repo_updates=$(LC_ALL=C pacman -Qu --dbpath "$CHECK_DB" --color never || true)
 
 aur_updates=""
 if [[ -n "$AUR_HELPER" ]]; then
-    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}' || true)
-    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
+    if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
         if aur_raw=$("${HELPER_CMD[@]}" -Qua --dbpath "$CHECK_DB" --color never 2>/dev/null) && [[ -n "$aur_raw" ]]; then
             aur_updates="$aur_raw"
         fi
@@ -2198,8 +2201,7 @@ fi
 
 if [[ -n "$aur_pkgs" && -n "$AUR_HELPER" ]]; then
     log_step "Fetching AUR metadata..."
-    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
-    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
+    if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
         while IFS='' read -r line; do
             NEW_DATA["${line%%~|~*}"]="${line#*~|~}"
         done < <(echo "$aur_pkgs" | xargs -r env LC_ALL=C "${HELPER_CMD[@]}" -Si 2>/dev/null | parse_metadata "AUR")
@@ -2821,9 +2823,7 @@ check_pending_updates() {
     pending=$(LC_ALL=C pacman -Qu 2>/dev/null || true)
 
     if [[ "$check_mode" != "repo_only" && -n "$AUR_HELPER" ]]; then
-        local helper_bin
-        helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}' || true)
-        if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
+        if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
             local aur_pending
             aur_pending=$("${HELPER_CMD[@]}" -Qua --color never 2>/dev/null || true)
 
@@ -2900,7 +2900,7 @@ elif [[ -n "$BEST_UPDATE_TOOL" && "$HAS_TOPGRADE" == "true" ]]; then
     PROMPT_CMD="$BEST_UPDATE_TOOL && topgrade"
 elif [[ -n "$BEST_UPDATE_TOOL" ]]; then
     PROMPT_CMD="$BEST_UPDATE_TOOL"
-    [[ -n "$AUR_HELPER" ]] && PROMPT_CMD="$PROMPT_CMD (fallback: $(echo "$AUR_HELPER" | awk '{print $1}'))"
+    [[ -n "$AUR_HELPER" ]] && PROMPT_CMD="$PROMPT_CMD (fallback: $HELPER_BIN)"
 elif [[ "$HAS_TOPGRADE" == "true" ]]; then
     PROMPT_CMD="topgrade"
 else
@@ -3052,15 +3052,14 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                 if [[ -n "$pending_updates" && -n "$AUR_HELPER" ]]; then
                     echo -e "\n${yellow}$tool_name did not fully apply all updates (likely AUR packages remaining).${reset}"
 
-                    helper_bin=$(echo "$AUR_HELPER" | awk '{print $1}')
                     aur_flags="-Syu"
-                    if [[ "$helper_bin" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku)$ && $core_exit -eq 0 ]]; then
+                    if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku)$ && $core_exit -eq 0 ]]; then
                         aur_flags="-Sua"
-                    elif [[ "$helper_bin" == "rua" ]]; then
+                    elif [[ "$HELPER_BIN" == "rua" ]]; then
                         aur_flags="upgrade"
                     fi
 
-                    echo -ne "${white}Run $helper_bin to apply remaining updates? [Y/n]: ${reset}"
+                    echo -ne "${white}Run $HELPER_BIN to apply remaining updates? [Y/n]: ${reset}"
                     if read -r force_aur; then
                         if [[ "$force_aur" =~ ^[Yy]$ || -z "$force_aur" ]]; then
                             execute_update_task "$AUR_HELPER $aur_flags"
@@ -3095,7 +3094,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         else
             echo -e "${blue}${bold}Running standard system update...${reset}"
             if [[ -n "$AUR_HELPER" ]]; then
-                if [[ "$helper_bin" == "rua" ]]; then
+                if [[ "$HELPER_BIN" == "rua" ]]; then
                     execute_update_task "sudo pacman -Syu && rua upgrade"
                     core_exit=$?
                 else
@@ -3150,15 +3149,14 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                 sudo pacman -Sc --noconfirm >/dev/null 2>&1
             fi
 
-            helper_bin=$(echo "${AUR_HELPER:-}" | awk '{print $1}')
             helpers_to_clean=()
             
-            if [[ -n "$helper_bin" ]]; then
-                helpers_to_clean+=("$helper_bin")
+            if [[ -n "$HELPER_BIN" ]]; then
+                helpers_to_clean+=("$HELPER_BIN")
             fi
             
             for h in "yay" "paru" "pikaur" "trizen" "pacaur" "pakku" "aura" "rua"; do
-                if [[ "$h" != "$helper_bin" ]]; then
+                if [[ "$h" != "$HELPER_BIN" ]]; then
                     helpers_to_clean+=("$h")
                 fi
             done
