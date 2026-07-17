@@ -15,7 +15,7 @@
 
 **arch-smart-update** is a bash wrapper designed to safeguard system updates on vanilla **Arch Linux** and its derivatives. Instead of updating blindly, it gives you complete control over the upgrade process by presenting **package build dates**, **package descriptions**, official **Arch news** alerts, and stability recommendations from an intelligent **Update Advisor** — enabling you to make an informed decision before delegating the actual transactions directly to **pacman**, an **AUR helper**, or **topgrade**.
 
-The script also supports distribution-specific utilities on **EndeavourOS** (such as `eos-update`) and **CachyOS** (such as `arch-update`), while remaining fully compatible with any other Arch-based system.
+The script also supports distribution-specific utilities on **EndeavourOS** (such as `eos-update`) and **CachyOS** (such as `cachy-update`), while remaining fully compatible with any other Arch-based system.
 
 ⚠️ **IMPORTANT DISCLAIMER:** The update recommendations provided by the Advisor are helpful guidelines, not absolute rules. As an Arch Linux user, **you are the system administrator** and hold ultimate responsibility for your machine. Always review the update list and use your own judgment before pressing "Y". The author is not responsible for any broken systems, unbootable kernels, or data loss!
 
