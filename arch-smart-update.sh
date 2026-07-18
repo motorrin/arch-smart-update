@@ -628,6 +628,42 @@ EOF
     exit 0
 fi
 
+parse_bash_array() {
+    local file="${1:-}"
+    local arr_name="${2:-}"
+    [[ -z "$file" || ! -f "$file" ]] && return 0
+    awk -v var="$arr_name" '
+        BEGIN { in_arr=0 }
+        { sub(/^[[:space:]]*#.*/, "") }
+        $0 ~ "^[[:space:]]*"var"(\\+)?=\\s*\\(" { in_arr=1; sub(/^.*\(/, "") }
+        in_arr {
+            tmp = $0
+            while (match(tmp, /"[^"]*"|\047[^\047]*\047/)) {
+                len = RLENGTH
+                replacement = ""
+                for (i=1; i<=len; i++) replacement = replacement " "
+                tmp = substr(tmp, 1, RSTART-1) replacement substr(tmp, RSTART+RLENGTH)
+            }
+            idx = index(tmp, "#")
+            if (idx > 0) {
+                tmp = substr(tmp, 1, idx - 1)
+                $0 = substr($0, 1, idx - 1)
+            }
+            if (match(tmp, /\)/)) {
+                $0 = substr($0, 1, RSTART-1)
+                in_arr=0
+            }
+            while (match($0, /"[^"]*"|\047[^\047]*\047|[^ \t\n\r"\047()]+/)) {
+                val = substr($0, RSTART, RLENGTH)
+                if (val ~ /^#/) break
+                gsub(/^["\047]|["\047]$/, "", val)
+                if (val != "") print val
+                $0 = substr($0, RSTART+RLENGTH)
+            }
+        }
+    ' "$file"
+}
+
 validate_user_conf() {
     local file="${1:-}"
     local label="${2:-}"
@@ -666,8 +702,12 @@ validate_user_conf() {
             fi
             if [[ "$trusted" == "false" ]]; then
                 if ! $DAEMON_MODE; then
-                    local trust_ans
-                    echo -e "${yellow}Warning: Active custom commands detected in settings.conf.${reset}"
+                    local trust_ans=""
+                    local cmd=""
+                    echo -e "${yellow}Warning: Active custom commands detected in settings.conf:${reset}"
+                    while IFS= read -r cmd; do
+                        [[ -n "$cmd" ]] && printf "  %b• %b%s%b\n" "${cyan}" "${white}" "$cmd" "${reset}"
+                    done < <(parse_bash_array "$file" "CUSTOM_CMDS")
                     echo -ne "${white}Do you trust and want to execute these custom commands? [y/N]: ${reset}"
                     read -r trust_ans </dev/tty || trust_ans="n"
                     if [[ "$trust_ans" =~ ^[Yy]$ ]]; then
@@ -685,42 +725,6 @@ validate_user_conf() {
     fi
 
     return 0
-}
-
-parse_bash_array() {
-    local file="${1:-}"
-    local arr_name="${2:-}"
-    [[ -z "$file" || ! -f "$file" ]] && return 0
-    awk -v var="$arr_name" '
-        BEGIN { in_arr=0 }
-        { sub(/^[[:space:]]*#.*/, "") }
-        $0 ~ "^[[:space:]]*"var"(\\+)?=\\s*\\(" { in_arr=1; sub(/^.*\(/, "") }
-        in_arr {
-            tmp = $0
-            while (match(tmp, /"[^"]*"|\047[^\047]*\047/)) {
-                len = RLENGTH
-                replacement = ""
-                for (i=1; i<=len; i++) replacement = replacement " "
-                tmp = substr(tmp, 1, RSTART-1) replacement substr(tmp, RSTART+RLENGTH)
-            }
-            idx = index(tmp, "#")
-            if (idx > 0) {
-                tmp = substr(tmp, 1, idx - 1)
-                $0 = substr($0, 1, idx - 1)
-            }
-            if (match(tmp, /\)/)) {
-                $0 = substr($0, 1, RSTART-1)
-                in_arr=0
-            }
-            while (match($0, /"[^"]*"|\047[^\047]*\047|[^ \t\n\r"\047()]+/)) {
-                val = substr($0, RSTART, RLENGTH)
-                if (val ~ /^#/) break
-                gsub(/^["\047]|["\047]$/, "", val)
-                if (val != "") print val
-                $0 = substr($0, RSTART+RLENGTH)
-            }
-        }
-    ' "$file"
 }
 
 mkdir -p "$CONFIG_DIR"
@@ -3253,22 +3257,6 @@ if [[ "$DAEMON_MODE" == "false" ]] && [ -t 0 ]; then
     read -r </dev/tty 2>/dev/null || read -r
     trap - EXIT INT TERM
     cleanup
-    if [[ "${ASU_SPAWNED:-}" == "true" ]] && [[ "$PPID" -gt 1 ]]; then
-        parent_comm=""
-        if [[ -r "/proc/$PPID/comm" ]]; then
-            parent_comm=$(cat "/proc/$PPID/comm" 2>/dev/null)
-        fi
-        if [[ -z "$parent_comm" ]]; then
-            parent_comm=$(ps -p "$PPID" -o comm= 2>/dev/null)
-        fi
-        parent_comm=$(echo "${parent_comm,,}" | tr -d '[:space:]')
-        case "$parent_comm" in
-            bash|zsh|fish|sh|ksh|dash|tcsh|csh)
-                trap '' HUP
-                kill -HUP "$PPID" 2>/dev/null
-                ;;
-        esac
-    fi
 fi
 
 sleep 0.1
