@@ -311,6 +311,7 @@ if [[ "${1:-}" == "--reconfigure" ]]; then
     fi
 
     if [[ -f "$SETTINGS_CONF" ]]; then
+        real_settings_conf=$(realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
         if [[ ! -f "$SETTINGS_DEFAULT" ]]; then
             echo -e "${yellow}Local settings.default.conf not found. Attempting template download...${reset}"
             if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
@@ -335,7 +336,7 @@ if [[ "${1:-}" == "--reconfigure" ]]; then
         fi
 
         if [[ -f "$SETTINGS_DEFAULT" ]]; then
-            python3 - "$SETTINGS_CONF" "$SETTINGS_DEFAULT" "$SETTINGS_CONF.tmp" <<'EOF'
+            python3 - "$real_settings_conf" "$SETTINGS_DEFAULT" "${real_settings_conf}.tmp" <<'EOF'
 import re, sys, os
 
 def strip_quotes_preserve_length(s):
@@ -380,7 +381,7 @@ def clean_comment_and_quotes(s):
             in_dquote = not in_dquote
         elif char == "'" and not in_dquote:
             in_squote = not in_squote
-        elif char == '#' and not in_dquote and not in_squote:
+        elif char == chr(35) and not in_dquote and not in_squote:
             break
         clean += char
     clean = clean.strip()
@@ -416,7 +417,7 @@ def parse(content):
                 idx_in_clean = temp.find(')')
                 last_part = clean_line[:idx_in_clean].strip()
                 if last_part:
-                    if last_part.startswith("#"):
+                    if last_part.startswith(chr(35)):
                         current_array_elems.append(last_part)
                     else:
                         for m in elem_re.finditer(last_part):
@@ -429,7 +430,7 @@ def parse(content):
                 current_array_elems = []
             else:
                 if line_stripped:
-                    if line_stripped.startswith("#"):
+                    if line_stripped.startswith(chr(35)):
                         current_array_elems.append(line_stripped)
                     else:
                         for m in elem_re.finditer(clean_line):
@@ -437,7 +438,7 @@ def parse(content):
                             if item is not None:
                                 current_array_elems.append(item)
         else:
-            if not line_stripped or line_stripped.startswith("#"):
+            if not line_stripped or line_stripped.startswith(chr(35)):
                 continue
 
             clean_line, temp = clean_comment_and_quotes(line_stripped)
@@ -457,7 +458,7 @@ def parse(content):
                     idx = temp.find(')')
                     rest_clean = rest[:idx].strip()
                     if rest_clean:
-                        if rest_clean.startswith("#"):
+                        if rest_clean.startswith(chr(35)):
                             current_array_elems.append(rest_clean)
                         else:
                             for m in elem_re.finditer(rest_clean):
@@ -478,17 +479,25 @@ def parse(content):
                         sc[k] = parts[1].strip()
     return sc, ar
 
+def norm_elem(x):
+    if (x.startswith('"') and x.endswith('"')) or (x.startswith("'") and x.endswith("'")):
+        return x[1:-1]
+    return x
+
+def norm_arr(arr):
+    return [norm_elem(x) for x in arr]
+
 u_sc, u_ar = {}, {}
 if os.path.exists(sys.argv[1]):
     try:
-        with open(sys.argv[1], "r", encoding="utf-8") as f:
+        with open(sys.argv[1], "r", encoding="utf-8", errors="surrogateescape") as f:
             u_sc, u_ar = parse(f.read())
     except Exception as e:
         print(f"Error parsing user configuration file: {e}", file=sys.stderr)
         sys.exit(1)
 
 try:
-    with open(sys.argv[2], "r", encoding="utf-8") as f:
+    with open(sys.argv[2], "r", encoding="utf-8", errors="surrogateescape") as f:
         t_content = f.read()
         t_lines = t_content.splitlines(keepends=True)
         t_sc, t_ar = parse(t_content)
@@ -523,12 +532,16 @@ for line_raw in t_lines:
         if ")" in temp:
             el = u_ar.get(arr_name)
             if el is not None:
-                if el:
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
-                    for item in el:
-                        out.append(f"    {item}\n")
+                default_el = t_ar.get(arr_name, [])
+                if norm_arr(el) == norm_arr(default_el):
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
                 else:
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                    if el:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    else:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                for item in el:
+                    out.append(f"    {item}\n")
             else:
                 default_el = t_ar.get(arr_name, [])
                 print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
@@ -551,12 +564,16 @@ for line_raw in t_lines:
             if el is not None:
                 out.pop()
                 out.append(f"{arr_name}=(\n")
-                if el:
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
-                    for item in el:
-                        out.append(f"    {item}\n")
+                default_el = t_ar.get(arr_name, [])
+                if norm_arr(el) == norm_arr(default_el):
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
                 else:
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                    if el:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    else:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                for item in el:
+                    out.append(f"    {item}\n")
                 out.append(")\n")
             else:
                 default_el = t_ar.get(arr_name, [])
@@ -569,7 +586,7 @@ for line_raw in t_lines:
     if m_sc:
         k = m_sc.group(2)
         migrated_scalars.add(k)
-        is_commented = m_sc.group(1) is not None and m_sc.group(1).strip().startswith("#")
+        is_commented = m_sc.group(1) is not None and m_sc.group(1).strip().startswith(chr(35))
         if k in u_sc:
             user_val = u_sc[k]
             default_val = t_sc.get(k, "N/A")
@@ -600,17 +617,22 @@ if orphans or orphan_arrays:
     for o in orphan_arrays:
         print(f"  {DIM}[Analyzing]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
 
-with open(sys.argv[3], "w", encoding="utf-8") as f:
-    f.writelines(out)
+try:
+    fd = os.open(sys.argv[3], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.writelines(out)
+except Exception as e:
+    print(f"Error writing configuration: {e}", file=sys.stderr)
+    sys.exit(1)
 EOF
-            if [[ $? -eq 0 && -f "$SETTINGS_CONF.tmp" ]]; then
-                mv "$SETTINGS_CONF.tmp" "$SETTINGS_CONF"
-                chmod 600 "$SETTINGS_CONF"
+            if [[ $? -eq 0 && -f "${real_settings_conf}.tmp" ]]; then
+                mv "${real_settings_conf}.tmp" "$real_settings_conf"
+                chmod 600 "$real_settings_conf"
                 echo -e "\n${green}Smart configuration migration for settings.conf has completed successfully.${reset}"
                 removed_any=true
             else
                 echo -e "${red}Error: Failed to process and merge configuration files.${reset}"
-                rm -f "$SETTINGS_CONF.tmp"
+                rm -f "${real_settings_conf}.tmp"
                 exit 1
             fi
         else
@@ -714,7 +736,98 @@ validate_user_conf() {
                         sha256sum "$file" | cut -d' ' -f1 > "$trust_file"
                     else
                         echo -e "${red}Error: Custom commands untrusted. Refusing to load settings.conf.${reset}"
-                        return 1
+                        echo -ne "${white}Would you like to remove these custom commands? [Y/n]: ${reset}"
+                        local remove_ans=""
+                        read -r remove_ans </dev/tty || remove_ans="n"
+                        if [[ "$remove_ans" =~ ^[Yy]$ || -z "$remove_ans" ]]; then
+                            if python3 - "$file" <<'EOF'
+import sys, re, os
+try:
+    target_file = os.path.realpath(sys.argv[1])
+    with open(target_file, "r", encoding="utf-8", errors="surrogateescape") as f:
+        content = f.read()
+    output = []
+    idx = 0
+    n = len(content)
+    while idx < n:
+        if idx == 0 or content[idx-1] == '\n':
+            match = re.match(r'([ \t]*)CUSTOM_CMDS\s*(?:\+)?=\s*\(', content[idx:])
+        else:
+            match = None
+        if match:
+            indent = match.group(1)
+            idx += match.end()
+            in_dquote = False
+            in_squote = False
+            escaped = False
+            comment = False
+            paren_depth = 1
+            while idx < n:
+                char = content[idx]
+                if escaped:
+                    escaped = False
+                    idx += 1
+                    continue
+                if comment:
+                    if char == '\n':
+                        comment = False
+                    idx += 1
+                    continue
+                if in_dquote:
+                    if char == '\\':
+                        escaped = True
+                    elif char == '"':
+                        in_dquote = False
+                    idx += 1
+                    continue
+                if in_squote:
+                    if char == "'":
+                        in_squote = False
+                    idx += 1
+                    continue
+                if char == '\\':
+                    escaped = True
+                elif char == chr(35):
+                    comment = True
+                elif char == '"':
+                    in_dquote = True
+                elif char == "'":
+                    in_squote = True
+                elif char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+                    if paren_depth == 0:
+                        idx += 1
+                        break
+                idx += 1
+            if paren_depth > 0:
+                raise ValueError("Mismatched parenthesis")
+            output.append(f"{indent}CUSTOM_CMDS=()")
+        else:
+            output.append(content[idx])
+            idx += 1
+    sanitized = "".join(output)
+    tmp_file = target_file + ".tmp"
+    fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.write(sanitized)
+    os.replace(tmp_file, target_file)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+EOF
+                            then
+                                chmod 600 "$file"
+                                echo -e "${green}Custom commands removed. settings.conf loaded successfully.${reset}"
+                                return 0
+                            else
+                                echo -e "${red}Error: Failed to sanitize custom commands from settings.conf.${reset}"
+                                return 1
+                            fi
+                        else
+                            return 1
+                        fi
                     fi
                 else
                     echo -e "${red}Error: Unverified custom commands detected in settings.conf in background mode.${reset}"
