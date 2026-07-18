@@ -740,13 +740,19 @@ validate_user_conf() {
                         local remove_ans=""
                         read -r remove_ans </dev/tty || remove_ans="n"
                         if [[ "$remove_ans" =~ ^[Yy]$ || -z "$remove_ans" ]]; then
-                            if python3 - "$file" <<'EOF'
+                            local default_param=""
+                            if [[ -n "${SETTINGS_DEFAULT:-}" && -f "$SETTINGS_DEFAULT" ]]; then
+                                local def_owner def_perms
+                                def_owner=$(stat -Lc '%u' "$SETTINGS_DEFAULT" 2>/dev/null || echo "")
+                                def_perms=$(stat -Lc '%a' "$SETTINGS_DEFAULT" 2>/dev/null || echo "")
+                                if [[ "$def_owner" == "$(id -u)" || "$def_owner" == "0" ]] && [[ "$def_perms" =~ ^[0-7]+$ ]] && ! (( 8#${def_perms} & 8#022 )); then
+                                    default_param="$SETTINGS_DEFAULT"
+                                fi
+                            fi
+                            if python3 - "$file" "$default_param" <<'EOF'
 import sys, re, os
-try:
-    target_file = os.path.realpath(sys.argv[1])
-    with open(target_file, "r", encoding="utf-8", errors="surrogateescape") as f:
-        content = f.read()
-    output = []
+
+def parse_and_get_block(content):
     idx = 0
     n = len(content)
     while idx < n:
@@ -755,7 +761,7 @@ try:
         else:
             match = None
         if match:
-            indent = match.group(1)
+            start_idx = idx
             idx += match.end()
             in_dquote = False
             in_squote = False
@@ -801,11 +807,109 @@ try:
                         idx += 1
                         break
                 idx += 1
+            if paren_depth == 0:
+                return content[start_idx:idx]
+        idx += 1
+    return None
+
+def is_block_safe(block):
+    if not block:
+        return True
+    inner = re.sub(r'^CUSTOM_CMDS\s*(?:\+)?=\s*\(', '', block.strip())
+    if inner.endswith(')'):
+        inner = inner[:-1]
+    for line in inner.splitlines():
+        line_stripped = line.strip()
+        if not line_stripped:
+            continue
+        if line_stripped.startswith('#'):
+            continue
+        return False
+    return True
+
+try:
+    target_file = os.path.realpath(sys.argv[1])
+    default_file = os.path.realpath(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else None
+    with open(target_file, "r", encoding="utf-8", errors="surrogateescape") as f:
+        target_content = f.read()
+    default_block = None
+    if default_file and os.path.exists(default_file):
+        try:
+            with open(default_file, "r", encoding="utf-8", errors="surrogateescape") as f:
+                default_content = f.read()
+            parsed_block = parse_and_get_block(default_content)
+            if parsed_block and is_block_safe(parsed_block):
+                default_block = parsed_block
+        except Exception:
+            pass
+    if not default_block:
+        default_block = "CUSTOM_CMDS=()"
+    output = []
+    idx = 0
+    n = len(target_content)
+    replaced = False
+    while idx < n:
+        if idx == 0 or target_content[idx-1] == '\n':
+            match = re.match(r'([ \t]*)CUSTOM_CMDS\s*(?:\+)?=\s*\(', target_content[idx:])
+        else:
+            match = None
+        if match:
+            idx += match.end()
+            in_dquote = False
+            in_squote = False
+            escaped = False
+            comment = False
+            paren_depth = 1
+            while idx < n:
+                char = target_content[idx]
+                if escaped:
+                    escaped = False
+                    idx += 1
+                    continue
+                if comment:
+                    if char == '\n':
+                        comment = False
+                    idx += 1
+                    continue
+                if in_dquote:
+                    if char == '\\':
+                        escaped = True
+                    elif char == '"':
+                        in_dquote = False
+                    idx += 1
+                    continue
+                if in_squote:
+                    if char == "'":
+                        in_squote = False
+                    idx += 1
+                    continue
+                if char == '\\':
+                    escaped = True
+                elif char == chr(35):
+                    comment = True
+                elif char == '"':
+                    in_dquote = True
+                elif char == "'":
+                    in_squote = True
+                elif char == '(':
+                    paren_depth += 1
+                elif char == ')':
+                    paren_depth -= 1
+                    if paren_depth == 0:
+                        idx += 1
+                        break
+                idx += 1
             if paren_depth > 0:
                 raise ValueError("Mismatched parenthesis")
-            output.append(f"{indent}CUSTOM_CMDS=()")
+            indent = match.group(1)
+            if not replaced:
+                stripped_default = default_block.lstrip()
+                output.append(f"{indent}{stripped_default}")
+                replaced = True
+            else:
+                output.append(f"{indent}CUSTOM_CMDS=()")
         else:
-            output.append(content[idx])
+            output.append(target_content[idx])
             idx += 1
     sanitized = "".join(output)
     tmp_file = target_file + ".tmp"
