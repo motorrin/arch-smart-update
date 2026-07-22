@@ -43,8 +43,8 @@ The script also supports distribution-specific utilities on **EndeavourOS** (suc
 - **🔒 Intelligent Lock File Removal:** Detects a stale `/var/lib/pacman/db.lck` file and checks if a package manager is actually running. It uses `fuser` if available, or natively extracts the lock PID and scans the process table (`pgrep` / `/proc`) as a fallback to safely remove phantom locks.
 - **🚨 IgnorePkg Conflict Checker:** If you have frozen packages via `pacman.conf`, the script simulates the update in the background and warns you of any dependency breakages caused by skipped packages.
 - **🧹 Automated System Cleanup:** Optional post-update cleanup that safely removes orphaned packages, clears partial downloads, empties the pacman/AUR cache, vacuums the systemd journal (keeping 100M), and clears user thumbnail caches.
-- **🧩 Seamless Ecosystem Integration:** Full, native support for AUR helpers (`yay`, `paru`), as well as synergy with `eos-update` and `topgrade` to handle your Flatpaks, firmwares, and dotfiles.
-- **👻 Background Daemon & Notifications:** You can allow the script to run in the background using a user systemd timer. It silently checks for updates using `fakeroot` (no sudo required) and sends interactive desktop notifications via `libnotify`. Features a smart 3-notification limit for Arch News to prevent spam.
+- **🧩 Seamless Ecosystem Integration:** Full, native support for AUR helpers (`yay`, `paru`), as well as synergy with `eos-update` and `topgrade` to handle your Flatpaks, firmware, and dotfiles.
+- **👻 Background Daemon & Notifications:** You can allow the script to run in the background using a user systemd timer. It silently checks for updates using `fakeroot` (no sudo required) and sends interactive desktop notifications via `libnotify`. Features boot-session awareness for Arch News to prevent spam and alerts after 3 consecutive mirror connection failures.
 
 ---
 
@@ -87,7 +87,7 @@ Whenever the master configuration on GitHub is updated, the script will quietly 
 
 The script relies on standard system utilities, but make sure you have the following packages installed:
 
-`sudo pacman -S curl python bash tar gawk coreutils zstd grep sed`
+`sudo pacman -S curl python bash tar gawk coreutils zstd grep sed util-linux`
 
 *(Note: The python package provides python3 for the Arch News RSS check, zstd is required for accelerated local database backups, and util-linux provides the script utility used for interactive terminal emulation).*
 
