@@ -166,7 +166,7 @@ AUR:
 Manual *(if you downloaded it to a different folder, change the path accordingly)*:  
 `rm ~/arch-smart-update.sh`
 
-### 3. Remove configuration files, logs, news cache, and icon:
+### 3. Remove the configuration directory:
 
 `rm -rf ~/.config/arch-smart-update`
 
