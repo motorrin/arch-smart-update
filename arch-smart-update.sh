@@ -175,7 +175,7 @@ cleanup() {
         if [[ -d "$d" && "$d" == /tmp/* && "$d" != "/tmp/" ]]; then
             rm -rf -- "$d" 2>/dev/null
             if [[ -d "$d" ]]; then
-                sudo rm -rf -- "$d" 2>/dev/null
+                sudo -n rm -rf -- "$d" 2>/dev/null
             fi
         fi
     done
@@ -752,9 +752,10 @@ validate_user_conf() {
                             if python3 - "$file" "$default_param" <<'EOF'
 import sys, re, os
 
-def parse_and_get_block(content):
+def find_blocks(content):
     idx = 0
     n = len(content)
+    blocks = []
     while idx < n:
         if idx == 0 or content[idx-1] == '\n':
             match = re.match(r'([ \t]*)CUSTOM_CMDS\s*(?:\+)?=\s*\(', content[idx:])
@@ -762,6 +763,7 @@ def parse_and_get_block(content):
             match = None
         if match:
             start_idx = idx
+            indent = match.group(1)
             idx += match.end()
             in_dquote = False
             in_squote = False
@@ -808,9 +810,12 @@ def parse_and_get_block(content):
                         break
                 idx += 1
             if paren_depth == 0:
-                return content[start_idx:idx]
-        idx += 1
-    return None
+                blocks.append((start_idx, idx, indent))
+            else:
+                raise ValueError("Mismatched parenthesis")
+        else:
+            idx += 1
+    return blocks
 
 def is_block_safe(block):
     if not block:
@@ -820,9 +825,7 @@ def is_block_safe(block):
         inner = inner[:-1]
     for line in inner.splitlines():
         line_stripped = line.strip()
-        if not line_stripped:
-            continue
-        if line_stripped.startswith('#'):
+        if not line_stripped or line_stripped.startswith(chr(35)):
             continue
         return False
     return True
@@ -836,82 +839,36 @@ try:
     if default_file and os.path.exists(default_file):
         try:
             with open(default_file, "r", encoding="utf-8", errors="surrogateescape") as f:
-                default_content = f.read()
-            parsed_block = parse_and_get_block(default_content)
-            if parsed_block and is_block_safe(parsed_block):
-                default_block = parsed_block
+                def_content = f.read()
+            def_blocks = find_blocks(def_content)
+            if def_blocks:
+                b_start, b_end, _ = def_blocks[0]
+                extracted = def_content[b_start:b_end]
+                if is_block_safe(extracted):
+                    default_block = extracted
         except Exception:
             pass
     if not default_block:
         default_block = "CUSTOM_CMDS=()"
-    output = []
-    idx = 0
-    n = len(target_content)
-    replaced = False
-    while idx < n:
-        if idx == 0 or target_content[idx-1] == '\n':
-            match = re.match(r'([ \t]*)CUSTOM_CMDS\s*(?:\+)?=\s*\(', target_content[idx:])
-        else:
-            match = None
-        if match:
-            idx += match.end()
-            in_dquote = False
-            in_squote = False
-            escaped = False
-            comment = False
-            paren_depth = 1
-            while idx < n:
-                char = target_content[idx]
-                if escaped:
-                    escaped = False
-                    idx += 1
-                    continue
-                if comment:
-                    if char == '\n':
-                        comment = False
-                    idx += 1
-                    continue
-                if in_dquote:
-                    if char == '\\':
-                        escaped = True
-                    elif char == '"':
-                        in_dquote = False
-                    idx += 1
-                    continue
-                if in_squote:
-                    if char == "'":
-                        in_squote = False
-                    idx += 1
-                    continue
-                if char == '\\':
-                    escaped = True
-                elif char == chr(35):
-                    comment = True
-                elif char == '"':
-                    in_dquote = True
-                elif char == "'":
-                    in_squote = True
-                elif char == '(':
-                    paren_depth += 1
-                elif char == ')':
-                    paren_depth -= 1
-                    if paren_depth == 0:
-                        idx += 1
-                        break
-                idx += 1
-            if paren_depth > 0:
-                raise ValueError("Mismatched parenthesis")
-            indent = match.group(1)
+
+    t_blocks = find_blocks(target_content)
+    if not t_blocks:
+        sanitized = target_content
+    else:
+        out = []
+        last_end = 0
+        replaced = False
+        for start, end, indent in t_blocks:
+            out.append(target_content[last_end:start])
             if not replaced:
-                stripped_default = default_block.lstrip()
-                output.append(f"{indent}{stripped_default}")
+                out.append(f"{indent}{default_block.lstrip()}")
                 replaced = True
             else:
-                output.append(f"{indent}CUSTOM_CMDS=()")
-        else:
-            output.append(target_content[idx])
-            idx += 1
-    sanitized = "".join(output)
+                out.append(f"{indent}CUSTOM_CMDS=()")
+            last_end = end
+        out.append(target_content[last_end:])
+        sanitized = "".join(out)
+
     tmp_file = target_file + ".tmp"
     fd = os.open(tmp_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
@@ -1527,6 +1484,32 @@ get_type_color() {
     esac
 }
 
+fetch_aur_updates_rpc() {
+    python3 -c '
+import urllib.request, json, sys, subprocess, urllib.parse
+try:
+    res = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True, check=True)
+    local_pkgs = {line.split()[0]: line.split()[1] for line in res.stdout.strip().split("\n") if len(line.split()) >= 2}
+    if not local_pkgs: sys.exit(0)
+    names = list(local_pkgs.keys())
+    aur_data = []
+    for i in range(0, len(names), 100):
+        chunk = names[i:i+100]
+        args = "&".join(f"arg[]={urllib.parse.quote(n)}" for n in chunk)
+        req = urllib.request.Request(f"https://aur.archlinux.org/rpc/?v=5&type=info&{args}", headers={"User-Agent": "ArchSmartUpdate/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("type") != "error": aur_data.extend(data.get("results", []))
+    for item in aur_data:
+        name, new_ver = item.get("Name"), item.get("Version")
+        old_ver = local_pkgs.get(name)
+        if old_ver and new_ver:
+            vc = subprocess.run(["vercmp", new_ver, old_ver], capture_output=True, text=True)
+            if vc.returncode == 0 and int(vc.stdout.strip() or 0) > 0:
+                print(f"{name} {old_ver} -> {new_ver}")
+except Exception: pass' 2>/dev/null
+}
+
 check_arch_news() {
     log_step "Starting Arch News check (Python)..."
     echo -ne "${gray}Checking Arch News...${reset}"
@@ -1809,12 +1792,9 @@ check_reboot_needed() {
         return 0
     fi
     
-    local boot_time
-    boot_time=$(uptime -s 2>/dev/null)
-    [[ -z "$boot_time" ]] && return 0
     local boot_ts
-    boot_ts=$(date -d "$boot_time" +%s 2>/dev/null)
-    [[ -z "$boot_ts" ]] && return 0
+    boot_ts=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null)
+    [[ -z "$boot_ts" || ! "$boot_ts" =~ ^[0-9]+$ ]] && return 0
     
     local read_cmd=(tail -n 4000 "$log_file")
     if [[ ! -r "$log_file" ]]; then
@@ -1868,7 +1848,12 @@ check_reboot_needed() {
 # --- 5. Mirror Refresh Function ---
 get_current_mirror() {
     local mirror
-    mirror=$(awk -F/ '/^Server[ \t]*=/ {print $3; exit}' /etc/pacman.d/mirrorlist 2>/dev/null)
+    mirror=$(awk '/^[ \t]*Server[ \t]*=/ {
+        sub(/^[ \t]*Server[ \t]*=[ \t]*/, "");
+        sub(/^[a-z]+:\/\//, "");
+        split($0, a, "/");
+        if (a[1] != "") { print a[1]; exit }
+    }' /etc/pacman.d/mirrorlist 2>/dev/null)
     echo "${mirror:-Unknown}"
 }
 
@@ -2322,29 +2307,7 @@ if [[ -n "$AUR_HELPER" ]]; then
             aur_updates="$aur_raw"
         fi
     else
-        if aur_raw=$(python3 -c '
-import urllib.request, json, sys, subprocess, urllib.parse
-try:
-    res = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True, check=True)
-    local_pkgs = {line.split()[0]: line.split()[1] for line in res.stdout.strip().split("\n") if len(line.split()) >= 2}
-    if not local_pkgs: sys.exit(0)
-    names = list(local_pkgs.keys())
-    aur_data = []
-    for i in range(0, len(names), 100):
-        chunk = names[i:i+100]
-        args = "&".join(f"arg[]={urllib.parse.quote(n)}" for n in chunk)
-        req = urllib.request.Request(f"https://aur.archlinux.org/rpc/?v=5&type=info&{args}", headers={"User-Agent": "ArchSmartUpdate/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if data.get("type") != "error": aur_data.extend(data.get("results", []))
-    for item in aur_data:
-        name, new_ver = item.get("Name"), item.get("Version")
-        old_ver = local_pkgs.get(name)
-        if old_ver and new_ver:
-            vc = subprocess.run(["vercmp", new_ver, old_ver], capture_output=True, text=True)
-            if vc.returncode == 0 and int(vc.stdout.strip() or 0) > 0:
-                print(f"{name} {old_ver} -> {new_ver}")
-except Exception: pass' 2>/dev/null); then
+        if aur_raw=$(fetch_aur_updates_rpc) && [[ -n "$aur_raw" ]]; then
             aur_updates="$aur_raw"
         fi
     fi
@@ -2599,26 +2562,29 @@ echo -e "\n"
 
 total_download_size="0.00 MiB"
 if [[ -s "$OUTPUT_FILE" ]]; then
-    # shellcheck disable=SC2016
-    total_download_size=$(env LC_ALL=C awk -F'\t' '{
-        if (tolower($8) != "aur" && $9 != "N/A" && $9 != "") {
-            split($9, a, " ")
-            val = a[1]
-            unit = a[2]
+    total_download_size=$(env LC_ALL=C awk -F'\t' -f - "$OUTPUT_FILE" <<'EOF'
+{
+    if (tolower($8) != "aur" && $9 != "N/A" && $9 != "") {
+        split($9, a, " ")
+        val = a[1]
+        unit = tolower(a[2])
 
-            if (unit == "KiB") val /= 1024
-            else if (unit == "GiB") val *= 1024
-            else if (unit == "B") val /= (1024 * 1024)
+        if (unit == "kib" || unit == "kb") val /= 1024
+        else if (unit == "gib" || unit == "gb") val *= 1024
+        else if (unit == "b" || unit == "bytes") val /= (1024 * 1024)
 
-            sum += val
-        }
-    } END {
-        if (sum >= 1024) {
-            printf "%.2f GiB", sum / 1024
-        } else {
-            printf "%.2f MiB", sum + 0
-        }
-    }' "$OUTPUT_FILE")
+        sum += val
+    }
+}
+END {
+    if (sum >= 1024) {
+        printf "%.2f GiB", sum / 1024
+    } else {
+        printf "%.2f MiB", sum + 0
+    }
+}
+EOF
+)
 fi
 
 # --- 7. Table Output ---
@@ -3083,53 +3049,21 @@ fi
 # --- 8. Update Request ---
 check_pending_updates() {
     local check_mode="${1:-all}"
-    local pending
+    local pending aur_pending=""
     pending=$(LC_ALL=C pacman -Qu 2>/dev/null || true)
 
     if [[ "$check_mode" != "repo_only" && -n "$AUR_HELPER" ]]; then
         if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku|aura)$ ]]; then
-            local aur_pending
             aur_pending=$("${HELPER_CMD[@]}" -Qua --color never 2>/dev/null || true)
-
-            if [[ -n "$aur_pending" ]]; then
-                if [[ -n "$pending" ]]; then
-                    pending="$pending"$'\n'"$aur_pending"
-                else
-                    pending="$aur_pending"
-                fi
-            fi
         else
-            local aur_pending
-            aur_pending=$(python3 -c '
-import urllib.request, json, sys, subprocess, urllib.parse
-try:
-    res = subprocess.run(["pacman", "-Qm"], capture_output=True, text=True, check=True)
-    local_pkgs = {line.split()[0]: line.split()[1] for line in res.stdout.strip().split("\n") if len(line.split()) >= 2}
-    if not local_pkgs: sys.exit(0)
-    names = list(local_pkgs.keys())
-    aur_data = []
-    for i in range(0, len(names), 100):
-        chunk = names[i:i+100]
-        args = "&".join(f"arg[]={urllib.parse.quote(n)}" for n in chunk)
-        req = urllib.request.Request(f"https://aur.archlinux.org/rpc/?v=5&type=info&{args}", headers={"User-Agent": "ArchSmartUpdate/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if data.get("type") != "error": aur_data.extend(data.get("results", []))
-    for item in aur_data:
-        name, new_ver = item.get("Name"), item.get("Version")
-        old_ver = local_pkgs.get(name)
-        if old_ver and new_ver:
-            vc = subprocess.run(["vercmp", new_ver, old_ver], capture_output=True, text=True)
-            if vc.returncode == 0 and int(vc.stdout.strip() or 0) > 0:
-                print(f"{name} {old_ver} -> {new_ver}")
-except Exception: pass' 2>/dev/null)
+            aur_pending=$(fetch_aur_updates_rpc || true)
+        fi
 
-            if [[ -n "$aur_pending" ]]; then
-                if [[ -n "$pending" ]]; then
-                    pending="$pending"$'\n'"$aur_pending"
-                else
-                    pending="$aur_pending"
-                fi
+        if [[ -n "$aur_pending" ]]; then
+            if [[ -n "$pending" ]]; then
+                pending="$pending"$'\n'"$aur_pending"
+            else
+                pending="$aur_pending"
             fi
         fi
     fi
