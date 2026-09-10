@@ -134,7 +134,7 @@ If you installed via AUR, the command is globally available as:
 If you installed Manually, the command is:  
 `~/arch-smart-update.sh`
 
-## ⌨️ Why write so many letters? Create an alias!
+## ⌨️ Why type out the full command? Use an alias
 
 ### 1. Check which shell you are using:
 `echo $SHELL`
