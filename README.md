@@ -46,7 +46,7 @@ The script also supports distribution-specific utilities on **EndeavourOS** (suc
 - **🚨 IgnorePkg Conflict Checker:** If you have frozen packages via `pacman.conf`, the script simulates the update in the background and warns you of any dependency breakages caused by skipped packages.
 - **🧹 Automated System Cleanup:** Optional post-update cleanup that safely removes orphaned packages, clears partial downloads, empties the pacman/AUR cache, vacuums the systemd journal (keeping 100M), and clears user thumbnail caches.
 - **🧩 Seamless Ecosystem Integration:** Full, native support for popular AUR helpers (`yay`, `paru`, `pikaur`, `aura`, `rua`, `trizen`, `pacaur`, `pakku`), an automatic built-in **AUR RPC API v5** client when no helper is installed, and compatibility with `eos-update`, `cachy-update`, and `topgrade` (to handle Flatpaks, firmware, and dotfiles).
-- **👻 Background Daemon & Notifications:** You can allow the script to run in the background using a user systemd timer. It silently checks for updates using `fakeroot` (no sudo required) and sends interactive desktop notifications via `libnotify`. Native support for Wayland compositors and X11 desktop environments. Features boot-session awareness for Arch News to prevent spam and alerts after 3 consecutive mirror connection failures.
+- **👻 Background Daemon & Notifications:** Fully integrated background update monitor powered by a systemd user timer. Silently checks for updates using `fakeroot` (no sudo required) and sends interactive desktop notifications with Wayland and X11 support. Features intelligent snoozing (`--silence`), dynamic timer adaptation to Update Advisor cooldowns, boot-session awareness for Arch News, and connection failure alerts. Can be effortlessly toggled via dedicated CLI commands.
 
 ---
 
@@ -134,6 +134,19 @@ If you installed via AUR, the command is globally available as:
 If you installed Manually, the command is:  
 `~/arch-smart-update.sh`
 
+### 💻 Command-Line Options
+
+| Option | Description |
+| :--- | :--- |
+| *(no arguments)* | Launch the interactive TUI to inspect pending updates and apply them. |
+| `--check` | Perform a single, silent background scan and test desktop notifications. |
+| `--enable-daemon` | Enable, configure, and immediately start the background systemd timer. |
+| `--disable-daemon` | Stop, disable, and cleanly remove the background systemd service and timer. |
+| `--silence [time]` | Silence/snooze notifications for a duration (e.g. `30m`, `2h`, `1d`) or cancel with `off`. |
+| `--reconfigure` | Smartly merge and update `settings.conf` with new upstream defaults while preserving custom settings. |
+| `--daemon` | Internal worker mode executed by the systemd timer. |
+| `-h`, `--help` | Show the help screen with all available options. |
+
 ## ⌨️ Why type out the full command? Use an alias
 
 ### 1. Check which shell you are using:
@@ -166,32 +179,31 @@ For fish:
 
 ## 🗑️ Uninstalling the script
 
-### 1. Make sure the background process is not running:
+### 1. Stop and remove the background service:
 
-`systemctl --user disable --now arch-smart-update.timer`
+If the script is still installed, run:  
+`arch-smart-update --disable-daemon`
 
-### 2. Remove the script (run one depending on your installation method):
+*(Alternative manual cleanup if the script was already removed)*:  
+`systemctl --user disable --now arch-smart-update.timer 2>/dev/null`  
+`rm -f ~/.config/systemd/user/arch-smart-update.{service,timer}`  
+`systemctl --user daemon-reload`
+
+### 2. Remove the script (depending on your installation method):
 
 AUR:  
 `sudo pacman -Rns arch-smart-update`
 
-Manual *(if you downloaded it to a different folder, change the path accordingly)*:  
+Manual *(if downloaded to a different folder, adjust accordingly)*:  
 `rm ~/arch-smart-update.sh`
 
 ### 3. Remove the configuration directory:
 `rm -rf ~/.config/arch-smart-update`
 
-### 4. Remove generated systemd files:
-`rm -f ~/.config/systemd/user/arch-smart-update.service`  
-
-`rm -f ~/.config/systemd/user/arch-smart-update.timer`  
-
-`systemctl --user daemon-reload`
-
-### 5. Delete Pacman database backups:
+### 4. Delete Pacman database backups:
 `sudo rm -f /var/lib/pacman/backup/pacman_database_*.tar.zst`
 
-### 6. Clear AUR helper build cache (if installed via AUR):
+### 5. Clear AUR helper build cache (if installed via AUR):
 `rm -rf ~/.cache/yay/arch-smart-update`
 
 `rm -rf ~/.cache/paru/clone/arch-smart-update`
