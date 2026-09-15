@@ -27,11 +27,14 @@ if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
     echo -e "${blue}${bold}Arch Smart Update${reset}"
     echo -e "\nUsage: ${white}${0##*/}${reset} [options]\n"
     echo -e "Options:"
-    echo -e "  ${cyan}(no arguments)${reset}  Run this to manually inspect pending updates in a detailed layout and choose when to install them."
-    echo -e "  ${cyan}--daemon${reset}        Run this in the background to automatically monitor updates and receive a desktop notification when they are ready."
-    echo -e "  ${cyan}--check${reset}         Run a single, quiet scan right now to check for updates and test your notification settings without keeping a service running."
-    echo -e "  ${cyan}--reconfigure${reset}   Align and update settings.conf with new default options while preserving custom settings."
-    echo -e "  ${cyan}--help, -h${reset}      Display this help screen showing all available options."
+    echo -e "  ${cyan}(no arguments)${reset}   Run this to manually inspect pending updates in a detailed layout and choose when to install them."
+    echo -e "  ${cyan}--daemon${reset}         Run this in the background to automatically monitor updates and receive a desktop notification when they are ready."
+    echo -e "  ${cyan}--check${reset}          Run a single, quiet scan right now to check for updates and test your notification settings without keeping a service running."
+    echo -e "  ${cyan}--enable-daemon${reset}  Enable and start the background update monitor service (systemd)."
+    echo -e "  ${cyan}--disable-daemon${reset} Disable and stop the background update monitor service (systemd)."
+    echo -e "  ${cyan}--silence [time]${reset} Silence background notifications (e.g. 6h, 1d) or cancel silence ('off')."
+    echo -e "  ${cyan}--reconfigure${reset}    Align and update settings.conf with new default options while preserving custom settings."
+    echo -e "  ${cyan}--help, -h${reset}       Display this help screen showing all available options."
     exit 0
 fi
 
@@ -53,8 +56,54 @@ USER_HOME="${HOME:-}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/arch-smart-update"
 mkdir -p "$CONFIG_DIR"
 
+PKG_CONF="$CONFIG_DIR/packages.conf"
+SETTINGS_DEFAULT="$CONFIG_DIR/settings.default.conf"
+SETTINGS_CONF="$CONFIG_DIR/settings.conf"
+DAEMON_TEMPLATE="$CONFIG_DIR/daemon.template"
+ICON_PATH="$CONFIG_DIR/ASU.png"
+
+DEFAULT_CHECK_INTERVAL="2h"
+DEFAULT_START_DELAY="5min"
+DEFAULT_SILENCE_UPDATES="6h"
+DEFAULT_NOTIFICATION_TIMEOUT=15000
+DEFAULT_MAX_BACKUP_COPIES=5
+DEFAULT_MAX_LOG_NUMBERS=5
+DEFAULT_MIN_DISK_SPACE_MB=2048
+DEFAULT_MIN_BTRFS_SPACE_MB=4608
+DEFAULT_T_MIRROR_H=3
+DEFAULT_T_FEAT_H=6
+DEFAULT_T_CRIT_H=12
+DEFAULT_T_DE_H=12
+DEFAULT_T_NUKE_H=24
+
+CHECK_INTERVAL="$DEFAULT_CHECK_INTERVAL"
+START_DELAY="$DEFAULT_START_DELAY"
+SILENCE_UPDATES="$DEFAULT_SILENCE_UPDATES"
+NOTIFICATION_TIMEOUT="$DEFAULT_NOTIFICATION_TIMEOUT"
+MAX_BACKUP_COPIES="$DEFAULT_MAX_BACKUP_COPIES"
+MAX_LOG_NUMBERS="$DEFAULT_MAX_LOG_NUMBERS"
+MIN_DISK_SPACE_MB="$DEFAULT_MIN_DISK_SPACE_MB"
+MIN_BTRFS_SPACE_MB="$DEFAULT_MIN_BTRFS_SPACE_MB"
+T_MIRROR_H="$DEFAULT_T_MIRROR_H"
+T_FEAT_H="$DEFAULT_T_FEAT_H"
+T_CRIT_H="$DEFAULT_T_CRIT_H"
+T_DE_H="$DEFAULT_T_DE_H"
+T_NUKE_H="$DEFAULT_T_NUKE_H"
+ENABLE_BACKGROUND_CHECK=false
+ENABLE_POST_CLEANUP=false
+ENABLE_AUR_REBUILD_CHECK=true
+GENERATE_LOGS=false
+IGNORE_PATCH_TIMERS=true
+PROMPT_MIRROR_REFRESH=false
+AUR_HELPER_OVERRIDE=""
+CUSTOM_RATE_MIRRORS_CMD=""
+CUSTOM_REFLECTOR_CMD=""
+
 ASU_TEMP_FILES=()
 ASU_TEMP_DIRS=()
+ASU_STATE_LOCK_FD=""
+ASU_STATE_LOCK_DEPTH=0
+ASU_STATE_LOCK_MODE=""
 
 create_temp_file() {
     local var_name="${1:-}"
@@ -72,6 +121,139 @@ create_temp_dir() {
     tmp=$(mktemp -d "/tmp/${prefix}.XXXXXX") || exit 1
     ASU_TEMP_DIRS+=("$tmp")
     printf -v "$var_name" "%s" "$tmp"
+}
+
+acquire_state_lock() {
+    local lock_mode="${1:-x}"
+    local lock_file="${CONFIG_DIR}/.state.lock"
+    touch "$lock_file" 2>/dev/null || return 1
+    if [[ -n "$ASU_STATE_LOCK_FD" ]]; then
+        if [[ "$ASU_STATE_LOCK_MODE" == "x" ]]; then
+            (( ASU_STATE_LOCK_DEPTH++ ))
+            return 0
+        elif [[ "$lock_mode" == "s" ]]; then
+            (( ASU_STATE_LOCK_DEPTH++ ))
+            return 0
+        else
+            if flock -w 5 -x "$ASU_STATE_LOCK_FD" 2>/dev/null; then
+                ASU_STATE_LOCK_MODE="x"
+                (( ASU_STATE_LOCK_DEPTH++ ))
+                return 0
+            fi
+            release_state_lock "true"
+            return 1
+        fi
+    fi
+    local fd=""
+    if exec {fd}<>"$lock_file" 2>/dev/null; then
+        if [[ "$lock_mode" == "s" ]]; then
+            if flock -w 5 -s "$fd" 2>/dev/null; then
+                ASU_STATE_LOCK_FD="$fd"
+                ASU_STATE_LOCK_MODE="s"
+                ASU_STATE_LOCK_DEPTH=1
+                return 0
+            fi
+        else
+            if flock -w 5 -x "$fd" 2>/dev/null; then
+                ASU_STATE_LOCK_FD="$fd"
+                ASU_STATE_LOCK_MODE="x"
+                ASU_STATE_LOCK_DEPTH=1
+                return 0
+            fi
+        fi
+        exec {fd}>&- 2>/dev/null || true
+    fi
+    return 1
+}
+
+release_state_lock() {
+    local force="${1:-false}"
+    if [[ "$force" == "true" ]]; then
+        ASU_STATE_LOCK_DEPTH=0
+    elif (( ASU_STATE_LOCK_DEPTH > 0 )); then
+        (( ASU_STATE_LOCK_DEPTH-- ))
+    fi
+    if (( ASU_STATE_LOCK_DEPTH == 0 )) && [[ -n "$ASU_STATE_LOCK_FD" ]]; then
+        if [[ "$ASU_STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
+            exec {ASU_STATE_LOCK_FD}>&- 2>/dev/null || true
+        fi
+        ASU_STATE_LOCK_FD=""
+        ASU_STATE_LOCK_MODE=""
+    fi
+}
+
+parse_duration_to_seconds() {
+    local raw="${1:-}"
+    local var_name="${2:-}"
+    local fallback="${3-}"
+    local sec=-1
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    if [[ "$raw" =~ ^([0-9]{1,9})$ ]]; then
+        local raw_val="${BASH_REMATCH[1]}"
+        local safe_num=$(( 10#$raw_val ))
+        sec=$(( safe_num * 3600 ))
+    elif [[ "$raw" =~ ^([0-9]{1,9})[[:space:]]*([a-zA-Z]+)$ ]]; then
+        local raw_val="${BASH_REMATCH[1]}"
+        local safe_num=$(( 10#$raw_val ))
+        local unit="${BASH_REMATCH[2],,}"
+        case "$unit" in
+            s|sec|secs|second|seconds) sec="$safe_num" ;;
+            m|min|mins|minute|minutes) sec=$(( safe_num * 60 )) ;;
+            h|hr|hrs|hour|hours) sec=$(( safe_num * 3600 )) ;;
+            d|day|days) sec=$(( safe_num * 86400 )) ;;
+            w|wk|wks|week|weeks) sec=$(( safe_num * 604800 )) ;;
+            *) sec=-1 ;;
+        esac
+    fi
+    if (( sec < 0 )) && [[ -n "$fallback" && "$raw" != "$fallback" ]]; then
+        parse_duration_to_seconds "$fallback" "$var_name" ""
+        return
+    fi
+    if (( sec < 0 )); then
+        sec=0
+    fi
+    if [[ -n "$var_name" ]]; then
+        printf -v "$var_name" "%s" "$sec"
+    else
+        echo "$sec"
+    fi
+}
+
+parse_timeout_to_ms() {
+    local raw="${1:-}"
+    local var_name="${2:-}"
+    local fallback="${3-$DEFAULT_NOTIFICATION_TIMEOUT}"
+    local ms=-1
+    raw="${raw#"${raw%%[![:space:]]*}"}"
+    raw="${raw%"${raw##*[![:space:]]}"}"
+    if [[ "$raw" =~ ^([0-9]{1,9})$ ]]; then
+        local raw_val="${BASH_REMATCH[1]}"
+        ms=$(( 10#$raw_val ))
+    elif [[ "$raw" =~ ^([0-9]{1,9})[[:space:]]*([a-zA-Z]+)$ ]]; then
+        local raw_val="${BASH_REMATCH[1]}"
+        local safe_num=$(( 10#$raw_val ))
+        local unit="${BASH_REMATCH[2],,}"
+        case "$unit" in
+            ms|msec|msecs|millisecond|milliseconds) ms="$safe_num" ;;
+            s|sec|secs|second|seconds) ms=$(( safe_num * 1000 )) ;;
+            m|min|mins|minute|minutes) ms=$(( safe_num * 60000 )) ;;
+            h|hr|hrs|hour|hours) ms=$(( safe_num * 3600000 )) ;;
+            *) ms=-1 ;;
+        esac
+    fi
+    if (( ms < 0 )) && [[ -n "$fallback" && "$raw" != "$fallback" ]]; then
+        parse_timeout_to_ms "$fallback" "$var_name" ""
+        return
+    fi
+    if (( ms < 0 )); then
+        ms="$DEFAULT_NOTIFICATION_TIMEOUT"
+    fi
+    if [[ -n "$var_name" ]]; then
+        printf -v "$var_name" "%s" "$ms"
+    else
+        echo "$ms"
+    fi
 }
 
 test_socket_alive() {
@@ -248,29 +430,19 @@ handle_notify_worker() {
     local notif_icon="${2:-software-update-available}"
     local pkg_count="${3:-0}"
     local aur_count="${4:-0}"
-    local notif_timeout=30000
+    local notif_timeout="${5:-$DEFAULT_NOTIFICATION_TIMEOUT}"
     local target_script
     target_script="$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")")"
 
-    local silence_cfg="6h"
-    if [[ -f "$CONFIG_DIR/settings.conf" ]]; then
-        local raw_silence raw_timeout
-        raw_silence=$(awk -F'=' '/^[[:space:]]*SILENCE_UPDATES[[:space:]]*=/ {gsub(/["\047]/, "", $2); sub(/[[:space:]]#.*$/, "", $2); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' "$CONFIG_DIR/settings.conf" 2>/dev/null || true)
-        [[ -n "$raw_silence" ]] && silence_cfg="$raw_silence"
-        raw_timeout=$(awk -F'=' '/^[[:space:]]*NOTIFICATION_TIMEOUT[[:space:]]*=/ {gsub(/["\047]/, "", $2); sub(/[[:space:]]#.*$/, "", $2); gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' "$CONFIG_DIR/settings.conf" 2>/dev/null || true)
-        if [[ "$raw_timeout" =~ ^([0-9]+)$ ]]; then
-            notif_timeout="${BASH_REMATCH[1]}"
-        elif [[ "$raw_timeout" =~ ^([0-9]+)[[:space:]]*([a-zA-Z]+)$ ]]; then
-            local t_num="${BASH_REMATCH[1]}"
-            local t_unit="${BASH_REMATCH[2],,}"
-            case "$t_unit" in
-                ms|msec|msecs|millisecond|milliseconds) notif_timeout="$t_num" ;;
-                s|sec|secs|second|seconds) notif_timeout=$(( t_num * 1000 )) ;;
-                m|min|mins|minute|minutes) notif_timeout=$(( t_num * 60000 )) ;;
-                h|hr|hrs|hour|hours) notif_timeout=$(( t_num * 3600000 )) ;;
-            esac
+    if [[ -f "$SETTINGS_CONF" ]]; then
+        if validate_user_conf "$SETTINGS_CONF" "settings.conf" "false"; then
+            load_daemon_params "$SETTINGS_CONF"
         fi
     fi
+
+    local silence_cfg="${SILENCE_UPDATES:-$DEFAULT_SILENCE_UPDATES}"
+    local raw_timeout="${NOTIFICATION_TIMEOUT:-${5:-$DEFAULT_NOTIFICATION_TIMEOUT}}"
+    parse_timeout_to_ms "$raw_timeout" notif_timeout "$DEFAULT_NOTIFICATION_TIMEOUT"
 
     local notif_daemon desktop_env supports_actions=false use_single_action=false action="" action_clean=""
     notif_daemon=$(dbus-send --session --print-reply --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.GetServerInformation 2>/dev/null | awk -F'"' '/string/ {print $2; exit}')
@@ -306,27 +478,15 @@ handle_notify_worker() {
     action_clean=$(echo "$action" | tr -d ' \n\r')
 
     if [[ "$action_clean" == "silence" || ( "$use_single_action" == "true" && "$action_clean" == "1" ) || ( "$use_single_action" == "false" && "$action_clean" == "2" ) ]]; then
-        local silence_sec=21600
-        if [[ "$silence_cfg" =~ ^([0-9]+)$ ]]; then
-            silence_sec=$(( BASH_REMATCH[1] * 3600 ))
-        elif [[ "$silence_cfg" =~ ^([0-9]+)[[:space:]]*([a-zA-Z]+)$ ]]; then
-            local num="${BASH_REMATCH[1]}"
-            local unit="${BASH_REMATCH[2],,}"
-            case "$unit" in
-                s|sec|secs|second|seconds) silence_sec="$num" ;;
-                m|min|mins|minute|minutes) silence_sec=$(( num * 60 )) ;;
-                h|hr|hrs|hour|hours) silence_sec=$(( num * 3600 )) ;;
-                d|day|days) silence_sec=$(( num * 86400 )) ;;
-                w|wk|wks|week|weeks) silence_sec=$(( num * 604800 )) ;;
-            esac
-        fi
+        local silence_sec=0
+        parse_duration_to_seconds "$silence_cfg" silence_sec "$DEFAULT_SILENCE_UPDATES"
         local silence_ts=$(( $(date +%s) + silence_sec ))
-        local lock_file="${CONFIG_DIR}/.state.lock"
-        if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-            if flock -w 5 -x 200 2>/dev/null; then
-                echo "$silence_ts" > "${CONFIG_DIR}/next_check.conf"
-            fi
-            exec 200>&- 2>/dev/null || true
+        if acquire_state_lock "x"; then
+            echo "${silence_ts}|silence" > "${CONFIG_DIR}/next_check.conf"
+            release_state_lock
+        fi
+        if command -v systemctl >/dev/null 2>&1; then
+            sync_daemon_state "true" >/dev/null 2>&1 || true
         fi
         exit 0
     elif [[ "$action_clean" == "update" || "$action_clean" == "default" || "$action_clean" == "0" || ( "$use_single_action" == "false" && "$action_clean" == "1" ) ]]; then
@@ -385,16 +545,6 @@ handle_notify_worker() {
     fi
 }
 
-if [[ "${1:-}" == "--notify-worker" ]]; then
-    handle_notify_worker "$@"
-    exit 0
-fi
-
-if [[ "${1:-}" == "--news-worker" ]]; then
-    handle_news_worker "$@"
-    exit 0
-fi
-
 if ! $DAEMON_MODE && [ -d "$CONFIG_DIR" ]; then
     dir_owner=$(stat -Lc '%u' "$CONFIG_DIR" 2>/dev/null || echo "")
     if [[ "$dir_owner" == "0" ]] || find "$CONFIG_DIR" -user root -print -quit 2>/dev/null | grep -q .; then
@@ -413,12 +563,6 @@ if ! $DAEMON_MODE && [ -d "$CONFIG_DIR" ]; then
     fi
 fi
 
-PKG_CONF="$CONFIG_DIR/packages.conf"
-SETTINGS_DEFAULT="$CONFIG_DIR/settings.default.conf"
-SETTINGS_CONF="$CONFIG_DIR/settings.conf"
-DAEMON_TEMPLATE="$CONFIG_DIR/daemon.template"
-ICON_PATH="$CONFIG_DIR/ASU.png"
-
 OUTPUT_FILE=""
 SYNC_LOG=""
 REFL_LOG=""
@@ -426,9 +570,10 @@ CHECK_DB=""
 SUDO_KEEP_ALIVE_PID=""
 CURRENT_TMP_LOG=""
 CURRENT_TASK_CAPTURE=""
-MANIFEST_TMP=""
 
 cleanup() {
+    release_state_lock "true"
+
     if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]] && kill -0 "$SUDO_KEEP_ALIVE_PID" 2>/dev/null; then
         kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null
     fi
@@ -571,373 +716,6 @@ update_from_github() {
     fi
 }
 
-if [[ "${1:-}" == "--reconfigure" ]]; then
-    SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
-    removed_any=false
-
-    if command -v systemctl >/dev/null 2>&1; then
-        if [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" || -f "$SYSTEMD_USER_DIR/arch-smart-update.service" ]]; then
-            systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
-            rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
-            systemctl --user daemon-reload >/dev/null 2>&1
-            removed_any=true
-        fi
-    fi
-
-    if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
-        manifest_updated=false
-        create_temp_file MANIFEST_TMP "manifest"
-        manifest_url="https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"
-        manifest_target=$(bypass_cdn_cache "$manifest_url")
-        if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "$manifest_target"; then
-            if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$MANIFEST_TMP"; then
-                mv "$MANIFEST_TMP" "$CONFIG_DIR/manifest.sha256"
-                MANIFEST_TMP=""
-                manifest_updated=true
-            else
-                rm -f "$MANIFEST_TMP"
-                MANIFEST_TMP=""
-                echo -e "${yellow}Warning: Downloaded manifest has an invalid format. Skipping config updates to prevent verification failures.${reset}"
-            fi
-        else
-            rm -f "$MANIFEST_TMP"
-            MANIFEST_TMP=""
-            echo -e "${yellow}Warning: Failed to update manifest.sha256. Skipping config updates to prevent verification failures.${reset}"
-        fi
-
-        if [[ -f "$CONFIG_DIR/manifest.sha256" ]]; then
-            if [ "$manifest_updated" = true ] || [ ! -f "$SETTINGS_DEFAULT" ] || [ ! -f "$PKG_CONF" ] || [ ! -f "$DAEMON_TEMPLATE" ] || [ ! -f "$ICON_PATH" ]; then
-                update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
-                update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/packages.conf" "NUCLEAR_PKGS"
-                update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/daemon.template" "[TimerTemplate]"
-                update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/ASU.png" ""
-            fi
-        elif [[ ! -f "$SETTINGS_DEFAULT" ]]; then
-            echo -e "${yellow}Warning: Manifest verification failed and local settings.default.conf is missing.${reset}"
-        fi
-    fi
-
-    if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
-        cp "$SETTINGS_DEFAULT" "$SETTINGS_CONF"
-        chmod 600 "$SETTINGS_CONF"
-    fi
-
-    if [[ -f "$SETTINGS_CONF" ]]; then
-        real_settings_conf=$(realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
-
-        if [[ -f "$SETTINGS_DEFAULT" ]]; then
-            python3 - "$real_settings_conf" "$SETTINGS_DEFAULT" "${real_settings_conf}.tmp" <<'EOF'
-import re, sys, os
-
-def strip_quotes_preserve_length(s):
-    chars = list(s)
-    in_dquote = False
-    in_squote = False
-    escaped = False
-    for i, char in enumerate(chars):
-        if escaped:
-            chars[i] = ' '
-            escaped = False
-            continue
-        if char == '\\':
-            chars[i] = ' '
-            escaped = True
-            continue
-        if char == '"' and not in_squote:
-            in_dquote = not in_dquote
-            chars[i] = ' '
-        elif char == "'" and not in_dquote:
-            in_squote = not in_squote
-            chars[i] = ' '
-        elif in_dquote or in_squote:
-            chars[i] = ' '
-    return "".join(chars)
-
-def clean_comment_and_quotes(s):
-    clean = ""
-    in_dquote = False
-    in_squote = False
-    escaped = False
-    for char in s:
-        if escaped:
-            clean += char
-            escaped = False
-            continue
-        if char == '\\':
-            clean += char
-            escaped = True
-            continue
-        if char == '"' and not in_squote:
-            in_dquote = not in_dquote
-        elif char == "'" and not in_dquote:
-            in_squote = not in_squote
-        elif char == chr(35) and not in_dquote and not in_squote:
-            break
-        clean += char
-    clean = clean.strip()
-    return clean, strip_quotes_preserve_length(clean)
-
-def parse(content):
-    sc = {}
-    ar = {}
-    raw_lines = content.splitlines()
-    lines = []
-    accumulator = ""
-    for r_line in raw_lines:
-        r_stripped = r_line.rstrip()
-        if r_stripped.endswith("\\"):
-            accumulator += r_stripped[:-1]
-        else:
-            accumulator += r_line
-            lines.append(accumulator)
-            accumulator = ""
-    if accumulator:
-        lines.append(accumulator)
-        
-    in_array = False
-    current_array_name = None
-    current_array_elems = []
-    elem_re = re.compile(r'("[^"\\]*(?:\\.[^"\\]*)*")|(\'[^\'\\]*(?:\\.[^\'\\]*)*\')|([^\s\(\)]+)')
-
-    for line in lines:
-        line_stripped = line.strip()
-        if in_array:
-            clean_line, temp = clean_comment_and_quotes(line_stripped)
-            if ')' in temp:
-                idx_in_clean = temp.find(')')
-                last_part = clean_line[:idx_in_clean].strip()
-                if last_part:
-                    if last_part.startswith(chr(35)):
-                        current_array_elems.append(last_part)
-                    else:
-                        for m in elem_re.finditer(last_part):
-                            item = m.group(1) or m.group(2) or m.group(3)
-                            if item is not None:
-                                current_array_elems.append(item)
-                ar[current_array_name] = current_array_elems
-                in_array = False
-                current_array_name = None
-                current_array_elems = []
-            else:
-                if line_stripped:
-                    if line_stripped.startswith(chr(35)):
-                        current_array_elems.append(line_stripped)
-                    else:
-                        for m in elem_re.finditer(clean_line):
-                            item = m.group(1) or m.group(2) or m.group(3)
-                            if item is not None:
-                                current_array_elems.append(item)
-        else:
-            if not line_stripped or line_stripped.startswith(chr(35)):
-                continue
-
-            clean_line, temp = clean_comment_and_quotes(line_stripped)
-            if not clean_line:
-                continue
-
-            m_arr = re.match(r"^([A-Za-z0-9_]+)\s*(\+)?=\s*\((.*)", clean_line)
-            if m_arr:
-                name = m_arr.group(1)
-                rest = m_arr.group(3).strip()
-                in_array = True
-                current_array_name = name
-                current_array_elems = []
-
-                temp = strip_quotes_preserve_length(rest)
-                if ')' in temp:
-                    idx = temp.find(')')
-                    rest_clean = rest[:idx].strip()
-                    if rest_clean:
-                        if rest_clean.startswith(chr(35)):
-                            current_array_elems.append(rest_clean)
-                        else:
-                            for m in elem_re.finditer(rest_clean):
-                                item = m.group(1) or m.group(2) or m.group(3)
-                                if item is not None:
-                                    current_array_elems.append(item)
-                    ar[name] = current_array_elems
-                    in_array = False
-                    current_array_name = None
-                    current_array_elems = []
-            else:
-                if "=" in clean_line:
-                    parts = clean_line.split("=", 1)
-                    k = parts[0].strip()
-                    if k.endswith("+"):
-                        k = k[:-1].strip()
-                    if re.match(r"^[A-Za-z0-9_]+$", k):
-                        sc[k] = parts[1].strip()
-    return sc, ar
-
-def norm_elem(x):
-    if (x.startswith('"') and x.endswith('"')) or (x.startswith("'") and x.endswith("'")):
-        return x[1:-1]
-    return x
-
-def norm_arr(arr):
-    return [norm_elem(x) for x in arr]
-
-u_sc, u_ar = {}, {}
-if os.path.exists(sys.argv[1]):
-    try:
-        with open(sys.argv[1], "r", encoding="utf-8", errors="surrogateescape") as f:
-            u_sc, u_ar = parse(f.read())
-    except Exception as e:
-        print(f"Error parsing user configuration file: {e}", file=sys.stderr)
-        sys.exit(1)
-
-try:
-    with open(sys.argv[2], "r", encoding="utf-8", errors="surrogateescape") as f:
-        t_content = f.read()
-        t_lines = t_content.splitlines(keepends=True)
-        t_sc, t_ar = parse(t_content)
-except Exception as e:
-    print(f"Error reading configuration template: {e}", file=sys.stderr)
-    sys.exit(1)
-
-out = []
-in_arr = False
-arr_name = None
-migrated_scalars = set()
-migrated_arrays = set()
-
-is_tty = sys.stdout.isatty()
-BLUE = "\033[38;5;75m" if is_tty else ""
-GREEN = "\033[38;5;71m" if is_tty else ""
-YELLOW = "\033[38;5;214m" if is_tty else ""
-RED = "\033[38;5;196m" if is_tty else ""
-MAGENTA = "\033[38;5;176m" if is_tty else ""
-CYAN = "\033[38;5;79m" if is_tty else ""
-GRAY = "\033[38;5;244m" if is_tty else ""
-DIM = "\033[2m" if is_tty else ""
-BOLD = "\033[1m" if is_tty else ""
-RESET = "\033[0m" if is_tty else ""
-
-print(f"{BLUE}{BOLD}:: Commencing smart configuration migration...{RESET}")
-
-for line_raw in t_lines:
-    line = line_raw.strip()
-    if in_arr:
-        clean_line, temp = clean_comment_and_quotes(line)
-        if ")" in temp:
-            el = u_ar.get(arr_name)
-            if el is not None:
-                default_el = t_ar.get(arr_name, [])
-                if norm_arr(el) == norm_arr(default_el):
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
-                else:
-                    if el:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({len(el)} items). Preserving customized list.{RESET}")
-                    else:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
-                for item in el:
-                    out.append(f"    {item}\n")
-            else:
-                default_el = t_ar.get(arr_name, [])
-                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
-            out.append(line_raw)
-            in_arr = False
-        else:
-            if arr_name not in u_ar:
-                out.append(line_raw)
-        continue
-
-    m_arr = re.match(r"^([A-Za-z0-9_]+)\s*(\+)?=\s*\(", line)
-    if m_arr:
-        arr_name = m_arr.group(1)
-        out.append(line_raw)
-        migrated_arrays.add(arr_name)
-        clean_line, temp = clean_comment_and_quotes(line)
-        idx_paren = temp.find('(')
-        if idx_paren != -1 and ")" in temp[idx_paren+1:]:
-            el = u_ar.get(arr_name)
-            if el is not None:
-                out.pop()
-                out.append(f"{arr_name}=(\n")
-                default_el = t_ar.get(arr_name, [])
-                if norm_arr(el) == norm_arr(default_el):
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
-                else:
-                    if el:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
-                    else:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
-                for item in el:
-                    out.append(f"    {item}\n")
-                out.append(")\n")
-            else:
-                default_el = t_ar.get(arr_name, [])
-                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
-        else:
-            in_arr = True
-        continue
-
-    m_sc = re.match(r"^(\s*#\s*)?([A-Za-z0-9_]+)\s*(\+)?=\s*(.*)", line)
-    if m_sc:
-        k = m_sc.group(2)
-        migrated_scalars.add(k)
-        is_commented = m_sc.group(1) is not None and m_sc.group(1).strip().startswith(chr(35))
-        if k in u_sc:
-            user_val = u_sc[k]
-            default_val = t_sc.get(k, "N/A")
-            if user_val != default_val:
-                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
-            else:
-                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
-            out.append(f"{k}={user_val}\n")
-            continue
-        else:
-            if is_commented:
-                out.append(line_raw)
-                continue
-            else:
-                default_val = t_sc.get(k, "N/A")
-                print(f"  {DIM}[Analyzing]{RESET} Option {MAGENTA}{k:<23}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
-                out.append(line_raw)
-                continue
-
-    out.append(line_raw)
-
-orphans = set(u_sc.keys()) - migrated_scalars
-orphan_arrays = set(u_ar.keys()) - migrated_arrays
-if orphans or orphan_arrays:
-    print(f"\n{YELLOW}{BOLD}:: Deprecated parameter cleanup:{RESET}")
-    for o in orphans:
-        print(f"  {DIM}[Analyzing]{RESET} Option {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
-    for o in orphan_arrays:
-        print(f"  {DIM}[Analyzing]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
-
-try:
-    fd = os.open(sys.argv[3], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
-        f.writelines(out)
-except Exception as e:
-    print(f"Error writing configuration: {e}", file=sys.stderr)
-    sys.exit(1)
-EOF
-            if [[ $? -eq 0 && -f "${real_settings_conf}.tmp" ]]; then
-                mv "${real_settings_conf}.tmp" "$real_settings_conf"
-                chmod 600 "$real_settings_conf"
-                echo -e "\n${green}Smart configuration migration completed successfully.${reset}"
-                removed_any=true
-            else
-                echo -e "${red}Error: Failed to process and merge configuration files.${reset}"
-                rm -f "${real_settings_conf}.tmp"
-                exit 1
-            fi
-        else
-            echo -e "${red}Critical: Default configuration template settings.default.conf is missing.${reset}"
-            echo -e "${yellow}Your existing configuration settings.conf has been left intact.${reset}"
-            exit 1
-        fi
-    fi
-
-    if [[ "$removed_any" == "false" ]]; then
-        echo -e "${yellow}No active configuration or background service found to reset.${reset}"
-    fi
-    exit 0
-fi
-
 parse_bash_array() {
     local file="${1:-}"
     local arr_name="${2:-}"
@@ -977,6 +755,7 @@ parse_bash_array() {
 validate_user_conf() {
     local file="${1:-}"
     local label="${2:-}"
+    local check_custom="${3:-true}"
 
     [[ ! -f "$file" ]] && return 0
 
@@ -1001,7 +780,7 @@ validate_user_conf() {
         return 1
     fi
 
-    if [[ "$label" == "settings.conf" ]]; then
+    if [[ "$label" == "settings.conf" && "$check_custom" == "true" ]]; then
         if awk '/^[[:space:]]*CUSTOM_CMDS[[:space:]]*(\+)?[[:space:]]*=[[:space:]]*\(/ { in_block=1; sub(/^.*=[[:space:]]*\(/, ""); if ($0 ~ /\)/) { sub(/\).*$/, ""); sub(/#.*$/, ""); if ($0 ~ /[^[:space:]]/) { print "DANGER"; exit; } in_block=0; } else { sub(/#.*$/, ""); if ($0 ~ /[^[:space:]]/) { print "DANGER"; exit; } } next; } in_block && /^[[:space:]]*\)/ { in_block=0; next; } in_block && /^[[:space:]]*[^#[:space:]]/ { print "DANGER"; exit; }' "$file" | grep -q "DANGER"; then
             local conf_hash
             conf_hash=$(sha256sum "$file" | cut -d' ' -f1)
@@ -1190,6 +969,1204 @@ EOF
     return 0
 }
 
+NUCLEAR_PKGS=("glibc" "linux" "systemd" "pacman" "nvidia" "mkinitcpio")
+CRITICAL_PKGS=("base" "base-devel" "mesa" "wayland" "xorg-server" "dbus")
+FEATURE_PKGS=("pipewire" "plasma-desktop" "gnome-shell" "hyprland" "networkmanager")
+CUSTOM_CMDS=()
+SETTINGS_VALIDATION_FAILED=false
+
+sync_daemon_state() {
+    local force_restart="${1:-false}"
+    if [[ "${SETTINGS_VALIDATION_FAILED:-false}" == "true" ]]; then
+        return 0
+    fi
+
+    local QUIET=false
+    [[ "$DAEMON_MODE" == true ]] && QUIET=true
+
+    local SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
+    local bg_check="${ENABLE_BACKGROUND_CHECK:-false}"
+
+    if [[ "${bg_check,,}" == "true" ]]; then
+        if ! command -v fakeroot >/dev/null 2>&1; then
+            $QUIET || echo -e "${yellow}Background check requires 'fakeroot' (install base-devel). Disabling daemon.${reset}"
+            ENABLE_BACKGROUND_CHECK="false"
+            if command -v systemctl >/dev/null 2>&1; then
+                if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null || systemctl --user is-enabled --quiet arch-smart-update.timer 2>/dev/null || [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" ]]; then
+                    systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
+                    systemctl --user stop arch-smart-update.service >/dev/null 2>&1 || true
+                    rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
+                    systemctl --user daemon-reload >/dev/null 2>&1
+                fi
+            fi
+            return 0
+        fi
+
+        if ! command -v systemctl >/dev/null 2>&1; then
+            $QUIET || echo -e "${yellow}Notice: systemctl not found (non-systemd system).${reset}"
+            $QUIET || echo -e "${dim}To use the background checker, please manually schedule a cron job for: ${reset}${white}$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")") --daemon${reset}"
+            return 0
+        fi
+
+        mkdir -p "$SYSTEMD_USER_DIR"
+
+        if [[ ! -f "$DAEMON_TEMPLATE" ]]; then
+            $QUIET || echo -e "${yellow}Warning: Missing daemon.template. Cannot configure systemd units.${reset}"
+            return 1
+        fi
+
+        local SCRIPT_PATH TMP_SVC TMP_TMR
+        SCRIPT_PATH="$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")")"
+        create_temp_file TMP_SVC "asu_svc"
+        create_temp_file TMP_TMR "asu_tmr"
+
+        local CURRENT_INTERVAL="${CHECK_INTERVAL:-$DEFAULT_CHECK_INTERVAL}"
+        CURRENT_INTERVAL="$(echo "$CURRENT_INTERVAL" | tr -d '[:space:]')"
+        if [[ "$CURRENT_INTERVAL" =~ ^[0-9]+$ ]]; then
+            CURRENT_INTERVAL="${CURRENT_INTERVAL}h"
+        fi
+
+        local NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
+        if acquire_state_lock "x"; then
+            if [[ -f "$NEXT_CHECK_FILE" ]]; then
+                local file_mtime=0 boot_ts=0
+                file_mtime=$(stat -c %Y "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+                boot_ts=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null || echo 0)
+                local raw_next="" next_ts="" now_ts=0 existing_tag=""
+                raw_next=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+                next_ts="${raw_next%%|*}"
+                next_ts="${next_ts#"${next_ts%%[![:space:]]*}"}"
+                next_ts="${next_ts%"${next_ts##*[![:space:]]}"}"
+                if [[ "$raw_next" == *"|"* ]]; then
+                    existing_tag="${raw_next#*|}"
+                    existing_tag="${existing_tag#"${existing_tag%%[![:space:]]*}"}"
+                    existing_tag="${existing_tag%"${existing_tag##*[![:space:]]}"}"
+                fi
+                now_ts=$(date +%s)
+                if (( file_mtime > 0 && boot_ts > 0 && file_mtime < boot_ts )) && [[ "$existing_tag" != "silence" ]]; then
+                    rm -f "$NEXT_CHECK_FILE"
+                elif [[ "$next_ts" =~ ^[0-9]+$ ]] && (( next_ts > now_ts )); then
+                    local diff_m=$(( (next_ts - now_ts) / 60 + 1 ))
+                    (( diff_m < 1 )) && diff_m=1
+                    CURRENT_INTERVAL="${diff_m}min"
+                else
+                    rm -f "$NEXT_CHECK_FILE"
+                fi
+            fi
+            release_state_lock
+        fi
+
+        local START_DELAY_VAL="${START_DELAY:-$DEFAULT_START_DELAY}"
+        START_DELAY_VAL="$(echo "$START_DELAY_VAL" | tr -d '[:space:]')"
+        if [[ "$START_DELAY_VAL" =~ ^[0-9]+$ ]]; then
+            START_DELAY_VAL="${START_DELAY_VAL}min"
+        fi
+
+        export SCRIPT_PATH START_DELAY="$START_DELAY_VAL" CURRENT_INTERVAL
+        awk -v svc="$TMP_SVC" -v tmr="$TMP_TMR" '
+            BEGIN {
+                script = ENVIRON["SCRIPT_PATH"]
+                delay = ENVIRON["START_DELAY"]
+                interval = ENVIRON["CURRENT_INTERVAL"]
+            }
+            /^\[TimerTemplate\]/ { in_timer=1; next }
+            {
+                while ((idx = index($0, "__SCRIPT_PATH__")) > 0)
+                    $0 = substr($0, 1, idx - 1) "\"" script "\"" substr($0, idx + 15)
+                while ((idx = index($0, "__START_DELAY__")) > 0)
+                    $0 = substr($0, 1, idx - 1) delay substr($0, idx + 15)
+                while ((idx = index($0, "__CHECK_INTERVAL__")) > 0)
+                    $0 = substr($0, 1, idx - 1) interval substr($0, idx + 18)
+
+                if (in_timer) print > tmr
+                else print > svc
+            }
+        ' "$DAEMON_TEMPLATE"
+
+        if [[ ! -s "$TMP_SVC" || ! -s "$TMP_TMR" ]]; then
+            rm -f "$TMP_SVC" "$TMP_TMR"
+            $QUIET || echo -e "${yellow}Warning: Failed to generate systemd units from template.${reset}"
+            return 1
+        fi
+
+        local needs_reload=false
+        if ! cmp -s "$TMP_SVC" "$SYSTEMD_USER_DIR/arch-smart-update.service" || ! cmp -s "$TMP_TMR" "$SYSTEMD_USER_DIR/arch-smart-update.timer"; then
+            mv "$TMP_SVC" "$SYSTEMD_USER_DIR/arch-smart-update.service"
+            mv "$TMP_TMR" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
+            chmod 644 "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
+            needs_reload=true
+        else
+            rm -f "$TMP_SVC" "$TMP_TMR"
+        fi
+
+        if [[ "$needs_reload" == "true" ]]; then
+            systemctl --user daemon-reload >/dev/null 2>&1
+        fi
+
+        if ! systemctl --user is-enabled --quiet arch-smart-update.timer 2>/dev/null; then
+            systemctl --user enable arch-smart-update.timer >/dev/null 2>&1
+        fi
+
+        if ! systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null; then
+            systemctl --user start arch-smart-update.timer >/dev/null 2>&1
+        elif [[ "$force_restart" == "true" || "$needs_reload" == "true" ]]; then
+            systemctl --user restart arch-smart-update.timer >/dev/null 2>&1
+        fi
+        return 0
+    else
+        if command -v systemctl >/dev/null 2>&1; then
+            if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null || systemctl --user is-enabled --quiet arch-smart-update.timer 2>/dev/null || [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" ]]; then
+                systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
+                systemctl --user stop arch-smart-update.service >/dev/null 2>&1 || true
+                rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
+                systemctl --user daemon-reload >/dev/null 2>&1
+            fi
+        fi
+        return 0
+    fi
+}
+
+ensure_asu_base_configs() {
+    local force_update="${1:-false}"
+    local manifest_file="$CONFIG_DIR/manifest.sha256"
+    local manifest_updated=false
+
+    if [[ "$force_update" == "true" || ! -f "$DAEMON_TEMPLATE" || ! -f "$SETTINGS_DEFAULT" || ! -f "$manifest_file" || ! -f "$PKG_CONF" || ! -f "$ICON_PATH" ]]; then
+        if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
+            local tmp_m=""
+            create_temp_file tmp_m "manifest"
+            local manifest_target
+            manifest_target=$(bypass_cdn_cache "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256")
+            if curl -sLfo "$tmp_m" --connect-timeout 2 --max-time 4 "$manifest_target"; then
+                if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$tmp_m"; then
+                    mv "$tmp_m" "$manifest_file"
+                    tmp_m=""
+                    manifest_updated=true
+                else
+                    rm -f "$tmp_m"
+                    tmp_m=""
+                    echo -e "${yellow}Warning: Downloaded manifest has an invalid format. Skipping config updates to prevent verification failures.${reset}"
+                fi
+            else
+                rm -f "$tmp_m"
+                tmp_m=""
+                echo -e "${yellow}Warning: Failed to update manifest.sha256. Skipping config updates to prevent verification failures.${reset}"
+            fi
+
+            if [[ -f "$manifest_file" ]]; then
+                if [[ "$manifest_updated" == "true" || ! -f "$SETTINGS_DEFAULT" || ! -f "$PKG_CONF" || ! -f "$DAEMON_TEMPLATE" || ! -f "$ICON_PATH" ]]; then
+                    update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
+                    update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/packages.conf" "NUCLEAR_PKGS"
+                    update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/daemon.template" "[TimerTemplate]"
+                    update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/ASU.png" ""
+                fi
+            elif [[ ! -f "$SETTINGS_DEFAULT" ]]; then
+                echo -e "${yellow}Warning: Manifest verification failed and local settings.default.conf is missing.${reset}"
+            fi
+        fi
+    fi
+
+    [[ -f "$ICON_PATH" ]] && chmod 644 "$ICON_PATH" 2>/dev/null
+
+    if [[ ! -f "$DAEMON_TEMPLATE" || ! -f "$SETTINGS_DEFAULT" ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+write_bg_check_setting() {
+    local target_file="${1:-}"
+    local target_val="${2:-false}"
+
+    [[ -z "$target_file" ]] && return 1
+
+    local real_target
+    real_target=$(realpath -m "$target_file" 2>/dev/null || realpath "$target_file" 2>/dev/null || echo "$target_file")
+
+    if ! acquire_state_lock "x"; then
+        return 1
+    fi
+
+    if [[ ! -f "$real_target" ]]; then
+        if [[ -f "$SETTINGS_DEFAULT" ]]; then
+            if ! cp "$SETTINGS_DEFAULT" "$real_target"; then
+                release_state_lock
+                return 1
+            fi
+            chmod 600 "$real_target" 2>/dev/null || true
+        else
+            release_state_lock
+            return 1
+        fi
+    fi
+
+    local target_tmp="${real_target}.tmp"
+    ASU_TEMP_FILES+=("$target_tmp")
+
+    local trust_file="$CONFIG_DIR/.trusted_hash"
+    local was_trusted=false
+    local pre_cmds_hash=""
+    if [[ -f "$trust_file" ]]; then
+        local current_file_hash
+        current_file_hash=$(sha256sum "$real_target" 2>/dev/null | cut -d' ' -f1)
+        local stored_hash
+        stored_hash=$(cat "$trust_file" 2>/dev/null || true)
+        if [[ -n "$current_file_hash" && "$current_file_hash" == "$stored_hash" ]]; then
+            was_trusted=true
+            pre_cmds_hash=$(parse_bash_array "$real_target" "CUSTOM_CMDS" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        fi
+    fi
+
+    if ! python3 - "$real_target" "$target_val" "$target_tmp" <<'PYEOF'
+import sys, os, re
+
+tmp_path = sys.argv[3]
+try:
+    conf_path = os.path.realpath(sys.argv[1])
+    new_val = sys.argv[2]
+    lines = []
+    if os.path.exists(conf_path):
+        with open(conf_path, "r", encoding="utf-8", errors="surrogateescape") as f:
+            lines = f.readlines()
+
+    h = chr(35)
+    active_pattern = re.compile(r"^([ \t]*)ENABLE_BACKGROUND_CHECK\s*=[^" + h + r"\r\n]*(" + h + r".*)?$")
+    commented_pattern = re.compile(r"^([ \t]*)" + h + r"+[ \t]*ENABLE_BACKGROUND_CHECK\s*=[^" + h + r"\r\n]*(" + h + r".*)?$")
+
+    has_active = any(active_pattern.match(l.rstrip("\r\n")) for l in lines)
+    out = []
+    replaced = False
+
+    for line in lines:
+        rline = line.rstrip("\r\n")
+        m_act = active_pattern.match(rline)
+        m_com = commented_pattern.match(rline)
+
+        if m_act:
+            if not replaced:
+                indent = m_act.group(1)
+                comment = f" {m_act.group(2).strip()}" if m_act.group(2) else ""
+                out.append(f"{indent}ENABLE_BACKGROUND_CHECK={new_val}{comment}\n")
+                replaced = True
+            continue
+        elif m_com and not has_active:
+            if not replaced:
+                indent = m_com.group(1)
+                comment = f" {m_com.group(2).strip()}" if m_com.group(2) else ""
+                out.append(f"{indent}ENABLE_BACKGROUND_CHECK={new_val}{comment}\n")
+                replaced = True
+            else:
+                out.append(line)
+        else:
+            out.append(line)
+
+    if not replaced:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append(f"ENABLE_BACKGROUND_CHECK={new_val}\n")
+
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.writelines(out)
+    os.replace(tmp_path, conf_path)
+    sys.exit(0)
+except Exception:
+    if tmp_path and os.path.exists(tmp_path):
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    sys.exit(1)
+PYEOF
+    then
+        rm -f "$target_tmp" 2>/dev/null || true
+        release_state_lock
+        return 1
+    fi
+
+    chmod 600 "$real_target" 2>/dev/null || true
+
+    if [[ "$was_trusted" == "true" && -f "$trust_file" ]]; then
+        local post_cmds_hash
+        post_cmds_hash=$(parse_bash_array "$real_target" "CUSTOM_CMDS" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        if [[ "$post_cmds_hash" == "$pre_cmds_hash" ]]; then
+            sha256sum "$real_target" | cut -d' ' -f1 > "$trust_file"
+            chmod 600 "$trust_file" 2>/dev/null || true
+        else
+            rm -f "$trust_file"
+        fi
+    fi
+
+    release_state_lock
+    return 0
+}
+
+load_daemon_params() {
+    local file="${1:-}"
+    [[ -z "$file" || ! -f "$file" ]] && return 0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line%%[[:space:]]#*}"
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            local key="${BASH_REMATCH[1]}"
+            local val="${BASH_REMATCH[2]}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="${val%"${val##*[![:space:]]}"}"
+            if [[ "$val" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ || "$val" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            else
+                val="${val%%#*}"
+                val="${val%"${val##*[![:space:]]}"}"
+            fi
+            case "$key" in
+                ENABLE_BACKGROUND_CHECK|CHECK_INTERVAL|START_DELAY|SILENCE_UPDATES|NOTIFICATION_TIMEOUT)
+                    declare -g "$key=$val"
+                    ;;
+            esac
+        fi
+    done < "$file"
+
+    [[ -z "${CHECK_INTERVAL:-}" ]] && CHECK_INTERVAL="$DEFAULT_CHECK_INTERVAL"
+    [[ -z "${START_DELAY:-}" ]] && START_DELAY="$DEFAULT_START_DELAY"
+    [[ -z "${SILENCE_UPDATES:-}" ]] && SILENCE_UPDATES="$DEFAULT_SILENCE_UPDATES"
+    parse_timeout_to_ms "${NOTIFICATION_TIMEOUT:-$DEFAULT_NOTIFICATION_TIMEOUT}" NOTIFICATION_TIMEOUT "$DEFAULT_NOTIFICATION_TIMEOUT"
+}
+
+handle_enable_daemon() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo -e "${red}Error: systemctl not found (non-systemd system). Cannot enable daemon.${reset}"
+        exit 1
+    fi
+
+    if ! command -v fakeroot >/dev/null 2>&1; then
+        echo -e "${red}Error: Background update check requires 'fakeroot' (install base-devel).${reset}"
+        exit 1
+    fi
+
+    if ! ensure_asu_base_configs; then
+        echo -e "${red}Error: Failed to initialize configuration files. Network unreachable?${reset}"
+        exit 1
+    fi
+
+    if [[ ! -f "$DAEMON_TEMPLATE" ]]; then
+        echo -e "${red}Error: Missing daemon.template. Cannot configure systemd units.${reset}"
+        exit 1
+    fi
+
+    local real_settings_conf
+    real_settings_conf=$(realpath -m "$SETTINGS_CONF" 2>/dev/null || realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
+
+    if [[ -f "$real_settings_conf" ]]; then
+        if ! validate_user_conf "$real_settings_conf" "settings.conf" "true"; then
+            echo -e "${red}Error: settings.conf failed security validation. Aborting.${reset}"
+            exit 1
+        fi
+    fi
+
+    if ! write_bg_check_setting "$real_settings_conf" "true"; then
+        echo -e "${red}Error: Failed to write configuration to settings.conf.${reset}"
+        exit 1
+    fi
+    load_daemon_params "$real_settings_conf"
+
+    if acquire_state_lock "x"; then
+        rm -f "${CONFIG_DIR}/next_check.conf"
+        release_state_lock
+    else
+        rm -f "${CONFIG_DIR}/next_check.conf" 2>/dev/null || true
+    fi
+
+    ENABLE_BACKGROUND_CHECK="true"
+    if ! sync_daemon_state "true"; then
+        write_bg_check_setting "$real_settings_conf" "false" >/dev/null 2>&1 || true
+        ENABLE_BACKGROUND_CHECK="false"
+        sync_daemon_state "false" >/dev/null 2>&1 || true
+        echo -e "${red}Error: Failed to configure background service units.${reset}"
+        exit 1
+    fi
+
+    if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null && systemctl --user is-enabled --quiet arch-smart-update.timer 2>/dev/null; then
+        echo -e "${green}Systemd background update service successfully enabled and started.${reset}"
+        if ! pacman -Q libnotify >/dev/null 2>&1; then
+            echo -e "${yellow}Notice: 'libnotify' is not installed. Desktop notifications may not appear.${reset}"
+        fi
+        exit 0
+    else
+        write_bg_check_setting "$real_settings_conf" "false" >/dev/null 2>&1 || true
+        ENABLE_BACKGROUND_CHECK="false"
+        sync_daemon_state "false" >/dev/null 2>&1 || true
+        echo -e "${red}Error: Failed to activate arch-smart-update.timer via systemd.${reset}"
+        echo -e "${yellow}Notice: Check systemd user session status (e.g. systemctl --user status). Settings reverted.${reset}"
+        exit 1
+    fi
+}
+
+handle_disable_daemon() {
+    ensure_asu_base_configs "false" >/dev/null 2>&1 || true
+
+    local real_settings_conf conf_updated=false
+    real_settings_conf=$(realpath -m "$SETTINGS_CONF" 2>/dev/null || realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
+
+    local can_write=true
+    if [[ -f "$real_settings_conf" ]]; then
+        if ! validate_user_conf "$real_settings_conf" "settings.conf" "false"; then
+            can_write=false
+        fi
+    fi
+
+    if [[ "$can_write" == "true" ]]; then
+        if write_bg_check_setting "$real_settings_conf" "false"; then
+            conf_updated=true
+        fi
+    fi
+
+    if acquire_state_lock "x"; then
+        rm -f "${CONFIG_DIR}/next_check.conf"
+        release_state_lock
+    else
+        rm -f "${CONFIG_DIR}/next_check.conf" 2>/dev/null || true
+    fi
+
+    ENABLE_BACKGROUND_CHECK="false"
+    sync_daemon_state "false"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null || systemctl --user is-enabled --quiet arch-smart-update.timer 2>/dev/null; then
+            echo -e "${red}Error: Failed to completely disable and stop arch-smart-update.timer via systemd.${reset}"
+            exit 1
+        else
+            echo -e "${green}Systemd background update service successfully disabled and stopped.${reset}"
+            if [[ "$conf_updated" == "false" ]]; then
+                echo -e "${yellow}Notice: Timer was stopped, but settings.conf could not be safely updated.${reset}"
+            fi
+            exit 0
+        fi
+    else
+        if [[ "$conf_updated" == "true" ]]; then
+            echo -e "${green}Local configuration updated (ENABLE_BACKGROUND_CHECK=false).${reset}"
+        else
+            echo -e "${yellow}Notice: systemctl not found and settings.conf was not modified.${reset}"
+        fi
+        exit 0
+    fi
+}
+
+handle_silence() {
+    local raw_arg="${1:-}"
+    local silence_arg="$raw_arg"
+    silence_arg="${silence_arg#"${silence_arg%%[![:space:]]*}"}"
+    silence_arg="${silence_arg%"${silence_arg##*[![:space:]]}"}"
+
+    local real_settings_conf
+    real_settings_conf=$(realpath -m "$SETTINGS_CONF" 2>/dev/null || realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
+    if [[ -f "$real_settings_conf" ]]; then
+        if [[ "$silence_arg" == "-h" || "$silence_arg" == "--help" ]]; then
+            load_daemon_params "$real_settings_conf" 2>/dev/null || true
+        else
+            if ! validate_user_conf "$real_settings_conf" "settings.conf" "false"; then
+                echo -e "${red}Error: settings.conf failed security validation. Aborting.${reset}"
+                exit 1
+            fi
+            load_daemon_params "$real_settings_conf"
+        fi
+    fi
+
+    if [[ "$silence_arg" == "-h" || "$silence_arg" == "--help" ]]; then
+        local display_default="${SILENCE_UPDATES:-$DEFAULT_SILENCE_UPDATES}"
+        echo -e "${blue}${bold}Silence Notification Schedule${reset}"
+        echo -e "\nUsage: ${white}${0##*/} --silence${reset} [duration|off]\n"
+        echo -e "Options:"
+        echo -e "  ${cyan}(no argument)${reset}  Silence notifications using configured value (${white}${display_default}${reset})."
+        echo -e "  ${cyan}[duration]${reset}     Custom duration (e.g. ${white}30m${reset}, ${white}2h${reset}, ${white}1d${reset})."
+        echo -e "  ${cyan}off, cancel${reset}    Cancel active silence schedule and restore normal check interval."
+        exit 0
+    fi
+
+    local daemon_active=false
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null || systemctl --user is-enabled --quiet arch-smart-update.timer 2>/dev/null; then
+            daemon_active=true
+        fi
+    fi
+
+    local silence_cfg=""
+    local is_cancel=false
+
+    if [[ -n "$silence_arg" ]]; then
+        local silence_arg_lower="${silence_arg,,}"
+        local silence_arg_norm="${silence_arg_lower#--}"
+        silence_arg_norm="${silence_arg_norm#-}"
+        if [[ "$silence_arg_norm" =~ ^(0[a-zA-Z]*|off|reset|clear|cancel|none)$ ]]; then
+            is_cancel=true
+        elif [[ "$silence_arg_norm" == "default" ]]; then
+            silence_cfg="${SILENCE_UPDATES:-$DEFAULT_SILENCE_UPDATES}"
+        else
+            silence_cfg="$silence_arg"
+        fi
+    else
+        silence_cfg="${SILENCE_UPDATES:-$DEFAULT_SILENCE_UPDATES}"
+    fi
+
+    if [[ "$is_cancel" == "true" ]]; then
+        local cancel_ok=false
+        if acquire_state_lock "x"; then
+            rm -f "${CONFIG_DIR}/next_check.conf"
+            cancel_ok=true
+            release_state_lock
+        fi
+
+        if [[ "$cancel_ok" == "false" ]]; then
+            echo -e "${red}Error: Failed to acquire lock to cancel silence state.${reset}"
+            exit 1
+        fi
+
+        echo -e "${green}Notification silence cancelled. Standard schedule restored.${reset}"
+
+        if [[ "${ENABLE_BACKGROUND_CHECK,,}" != "true" ]]; then
+            echo -e "${yellow}Notice: Background monitor is disabled (ENABLE_BACKGROUND_CHECK=false).${reset}"
+        elif [[ "$daemon_active" == "false" ]]; then
+            echo -e "${yellow}Notice: Background check is enabled in settings, but systemd timer is currently inactive.${reset}"
+        else
+            ensure_asu_base_configs "false" >/dev/null 2>&1 || true
+            sync_daemon_state "true" >/dev/null 2>&1 || true
+        fi
+        exit 0
+    fi
+
+    local script_name="${0##*/}"
+    if [[ "${ENABLE_BACKGROUND_CHECK,,}" != "true" ]]; then
+        echo -e "${red}Error: Background monitor is disabled in configuration (ENABLE_BACKGROUND_CHECK=false).${reset}"
+        echo -e "${dim}Notifications are inactive. Use '${white}${script_name} --enable-daemon${dim}' to enable background checks.${reset}"
+        exit 1
+    fi
+
+    local has_systemd=false
+    if command -v systemctl >/dev/null 2>&1; then
+        has_systemd=true
+        if [[ "$daemon_active" == "false" ]]; then
+            echo -e "${red}Error: Systemd background timer is currently inactive.${reset}"
+            echo -e "${dim}Run '${white}${script_name} --enable-daemon${dim}' to activate the monitor before setting silence schedule.${reset}"
+            exit 1
+        fi
+    fi
+
+    if [[ "$has_systemd" == "true" ]]; then
+        if ! ensure_asu_base_configs "false"; then
+            echo -e "${red}Error: Failed to verify base configuration templates.${reset}"
+            exit 1
+        fi
+
+        if [[ ! -f "$DAEMON_TEMPLATE" ]]; then
+            echo -e "${red}Error: Missing daemon.template. Cannot configure silence timer.${reset}"
+            exit 1
+        fi
+    fi
+
+    [[ -z "$silence_cfg" ]] && silence_cfg="$DEFAULT_SILENCE_UPDATES"
+
+    local silence_sec=0
+    parse_duration_to_seconds "$silence_cfg" silence_sec
+
+    if (( silence_sec <= 0 )); then
+        echo -e "${red}Error: Invalid duration '${silence_cfg}'.${reset}"
+        echo -e "${dim}Valid examples: ${white}30m${dim}, ${white}2h${dim}, ${white}1d${dim}, or ${white}off${dim} to cancel.${reset}"
+        exit 1
+    fi
+
+    local now_ts silence_ts
+    now_ts=$(date +%s)
+    silence_ts=$(( now_ts + silence_sec ))
+
+    local write_ok=false
+    if acquire_state_lock "x"; then
+        echo "${silence_ts}|silence" > "${CONFIG_DIR}/next_check.conf"
+        write_ok=true
+        release_state_lock
+    fi
+
+    if [[ "$write_ok" == "false" ]]; then
+        echo -e "${red}Error: Failed to record silence schedule (lock timeout).${reset}"
+        exit 1
+    fi
+
+    if ! sync_daemon_state "true" >/dev/null 2>&1; then
+        echo -e "${red}Error: Failed to reschedule background timer.${reset}"
+        if acquire_state_lock "x"; then
+            rm -f "${CONFIG_DIR}/next_check.conf"
+            release_state_lock
+        fi
+        exit 1
+    fi
+
+    local until_time
+    until_time=$(date -d "@$silence_ts" +'%Y-%m-%d %H:%M:%S' 2>/dev/null || date -d "@$silence_ts" +%H:%M 2>/dev/null || echo "@$silence_ts")
+    echo -e "${green}Notifications silenced until ${white}${until_time}${green} (${silence_cfg}).${reset}"
+    exit 0
+}
+
+handle_reconfigure() {
+    local real_settings_conf orig_bg_val="" bg_val_found=false
+    local pre_reconf_cmds_hash="" reconf_was_trusted=false
+
+    real_settings_conf=$(realpath -m "$SETTINGS_CONF" 2>/dev/null || realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
+
+    if [[ -f "$real_settings_conf" ]]; then
+        if ! validate_user_conf "$real_settings_conf" "settings.conf"; then
+            echo -e "${red}Error: settings.conf validation failed before reconfiguration.${reset}"
+            exit 1
+        fi
+        local local_trust_file="$CONFIG_DIR/.trusted_hash"
+        if [[ -f "$local_trust_file" ]]; then
+            local curr_conf_hash
+            curr_conf_hash=$(sha256sum "$real_settings_conf" 2>/dev/null | cut -d' ' -f1)
+            if [[ -n "$curr_conf_hash" && "$curr_conf_hash" == "$(cat "$local_trust_file" 2>/dev/null)" ]]; then
+                reconf_was_trusted=true
+            fi
+        fi
+        orig_bg_val=$(awk '
+            /^[[:space:]]*ENABLE_BACKGROUND_CHECK[[:space:]]*=/ {
+                line = $0
+                sub(/\r$/, "", line)
+                sub(/^[[:space:]]*ENABLE_BACKGROUND_CHECK[[:space:]]*=[[:space:]]*/, "", line)
+                sub(/[[:space:]]*#.*$/, "", line)
+                gsub(/["\047]/, "", line)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", line)
+                val = tolower(line)
+                if (val == "true" || val == "false") res = val
+                else res = "invalid"
+            }
+            END {
+                if (res != "") print res
+            }
+        ' "$real_settings_conf" 2>/dev/null || true)
+        if [[ "$orig_bg_val" == "true" || "$orig_bg_val" == "false" ]]; then
+            bg_val_found=true
+        fi
+        pre_reconf_cmds_hash=$(parse_bash_array "$real_settings_conf" "CUSTOM_CMDS" 2>/dev/null | sha256sum | cut -d' ' -f1)
+    fi
+
+    ensure_asu_base_configs "true"
+
+    if [[ ! -f "$SETTINGS_DEFAULT" ]]; then
+        echo -e "${red}Critical: Default configuration template settings.default.conf is missing.${reset}"
+        echo -e "${yellow}Cannot proceed with reconfiguration without default template.${reset}"
+        exit 1
+    fi
+
+    local restart_daemon=false
+    local user_bg_choice=""
+    local can_run_daemon=true
+
+    if ! command -v systemctl >/dev/null 2>&1 || ! command -v fakeroot >/dev/null 2>&1; then
+        can_run_daemon=false
+    fi
+
+    if [[ "$bg_val_found" == "true" ]]; then
+        if [[ "$orig_bg_val" == "true" ]]; then
+            if [[ "$can_run_daemon" == "true" ]]; then
+                restart_daemon=true
+            else
+                echo -e "${yellow}Notice: Background monitor was enabled, but systemctl or fakeroot is missing. Disabling daemon.${reset}"
+                user_bg_choice="false"
+                restart_daemon=false
+            fi
+        fi
+    else
+        echo -e "${yellow}Warning: 'ENABLE_BACKGROUND_CHECK' setting was not found or is unconfigured in settings.conf.${reset}"
+        if ! command -v systemctl >/dev/null 2>&1; then
+            echo -e "${dim}Notice: systemctl not found. Background service cannot be enabled.${reset}"
+            user_bg_choice="false"
+            restart_daemon=false
+        elif ! command -v fakeroot >/dev/null 2>&1; then
+            echo -e "${dim}Notice: 'fakeroot' is not installed. Background update check is unavailable.${reset}"
+            user_bg_choice="false"
+            restart_daemon=false
+        else
+            echo -ne "${white}Do you want to enable and start the systemd background update service? [y/N]: ${reset}"
+            local ans_daemon="n"
+            read -r ans_daemon </dev/tty 2>/dev/null || read -r ans_daemon 2>/dev/null || ans_daemon="n"
+            if [[ "$ans_daemon" =~ ^[Yy]$ ]]; then
+                restart_daemon=true
+                user_bg_choice="true"
+            else
+                restart_daemon=false
+                user_bg_choice="false"
+            fi
+        fi
+    fi
+
+    if ! acquire_state_lock "x"; then
+        echo -e "${red}Error: Could not acquire lock on configuration state. Migration aborted.${reset}"
+        exit 1
+    fi
+
+    if [[ ! -f "$real_settings_conf" && -f "$SETTINGS_DEFAULT" ]]; then
+        cp "$SETTINGS_DEFAULT" "$real_settings_conf"
+        chmod 600 "$real_settings_conf"
+    fi
+
+    local reconf_tmp="${real_settings_conf}.tmp"
+    local py_exit=0
+    ASU_TEMP_FILES+=("$reconf_tmp")
+    rm -f "$reconf_tmp" 2>/dev/null || true
+
+    python3 - "$real_settings_conf" "$SETTINGS_DEFAULT" "$reconf_tmp" "${user_bg_choice:-}" <<'EOF'
+import re, sys, os
+
+def strip_quotes_preserve_length(s):
+    chars = list(s)
+    in_dquote = False
+    in_squote = False
+    escaped = False
+    for i, char in enumerate(chars):
+        if escaped:
+            chars[i] = ' '
+            escaped = False
+            continue
+        if char == '\\':
+            chars[i] = ' '
+            escaped = True
+            continue
+        if char == '"' and not in_squote:
+            in_dquote = not in_dquote
+            chars[i] = ' '
+        elif char == "'" and not in_dquote:
+            in_squote = not in_dquote
+            chars[i] = ' '
+        elif in_dquote or in_squote:
+            chars[i] = ' '
+    return "".join(chars)
+
+def clean_comment_and_quotes(s):
+    clean = ""
+    in_dquote = False
+    in_squote = False
+    escaped = False
+    for char in s:
+        if escaped:
+            clean += char
+            escaped = False
+            continue
+        if char == '\\':
+            clean += char
+            escaped = True
+            continue
+        if char == '"' and not in_squote:
+            in_dquote = not in_dquote
+        elif char == "'" and not in_dquote:
+            in_squote = not in_dquote
+        elif char == chr(35) and not in_dquote and not in_squote:
+            break
+        clean += char
+    clean = clean.strip()
+    return clean, strip_quotes_preserve_length(clean)
+
+def parse(content):
+    sc = {}
+    ar = {}
+    raw_lines = content.splitlines()
+    lines = []
+    accumulator = ""
+    for r_line in raw_lines:
+        r_stripped = r_line.rstrip()
+        if r_stripped.endswith("\\"):
+            accumulator += r_stripped[:-1]
+        else:
+            accumulator += r_line
+            lines.append(accumulator)
+            accumulator = ""
+    if accumulator:
+        lines.append(accumulator)
+
+    in_array = False
+    current_array_name = None
+    current_array_elems = []
+    elem_re = re.compile(r'("[^"\\]*(?:\\.[^"\\]*)*")|(\'[^\'\\]*(?:\\.[^\'\\]*)*\')|([^\s\(\)]+)')
+
+    for line in lines:
+        line_stripped = line.strip()
+        if in_array:
+            clean_line, temp = clean_comment_and_quotes(line_stripped)
+            if ')' in temp:
+                idx_in_clean = temp.find(')')
+                last_part = clean_line[:idx_in_clean].strip()
+                if last_part:
+                    if last_part.startswith(chr(35)):
+                        current_array_elems.append(last_part)
+                    else:
+                        for m in elem_re.finditer(last_part):
+                            item = m.group(1) or m.group(2) or m.group(3)
+                            if item is not None:
+                                current_array_elems.append(item)
+                ar[current_array_name] = current_array_elems
+                in_array = False
+                current_array_name = None
+                current_array_elems = []
+            else:
+                if line_stripped:
+                    if line_stripped.startswith(chr(35)):
+                        current_array_elems.append(line_stripped)
+                    else:
+                        for m in elem_re.finditer(clean_line):
+                            item = m.group(1) or m.group(2) or m.group(3)
+                            if item is not None:
+                                current_array_elems.append(item)
+        else:
+            if not line_stripped or line_stripped.startswith(chr(35)):
+                continue
+
+            clean_line, temp = clean_comment_and_quotes(line_stripped)
+            if not clean_line:
+                continue
+
+            m_arr = re.match(r"^([A-Za-z0-9_]+)\s*(\+)?=\s*\((.*)", clean_line)
+            if m_arr:
+                name = m_arr.group(1)
+                rest = m_arr.group(3).strip()
+                in_array = True
+                current_array_name = name
+                current_array_elems = []
+
+                temp = strip_quotes_preserve_length(rest)
+                if ')' in temp:
+                    idx = temp.find(')')
+                    rest_clean = rest[:idx].strip()
+                    if rest_clean:
+                        if rest_clean.startswith(chr(35)):
+                            current_array_elems.append(rest_clean)
+                        else:
+                            for m in elem_re.finditer(rest_clean):
+                                item = m.group(1) or m.group(2) or m.group(3)
+                                if item is not None:
+                                    current_array_elems.append(item)
+                        ar[name] = current_array_elems
+                        in_array = False
+                        current_array_name = None
+                        current_array_elems = []
+                else:
+                    if rest:
+                        if rest.startswith(chr(35)):
+                            current_array_elems.append(rest)
+                        else:
+                            for m in elem_re.finditer(rest):
+                                item = m.group(1) or m.group(2) or m.group(3)
+                                if item is not None:
+                                    current_array_elems.append(item)
+            else:
+                if "=" in clean_line:
+                    parts = clean_line.split("=", 1)
+                    k = parts[0].strip()
+                    if k.endswith("+"):
+                        k = k[:-1].strip()
+                    if re.match(r"^[A-Za-z0-9_]+$", k):
+                        sc[k] = parts[1].strip()
+    return sc, ar
+
+def norm_elem(x):
+    if (x.startswith('"') and x.endswith('"')) or (x.startswith("'") and x.endswith("'")):
+        return x[1:-1]
+    return x
+
+def norm_arr(arr):
+    return [norm_elem(x) for x in arr]
+
+u_sc, u_ar = {}, {}
+if os.path.exists(sys.argv[1]):
+    try:
+        with open(sys.argv[1], "r", encoding="utf-8", errors="surrogateescape") as f:
+            u_sc, u_ar = parse(f.read())
+    except Exception as e:
+        print(f"Error parsing user configuration file: {e}", file=sys.stderr)
+        sys.exit(1)
+
+prompted_keys = set()
+if len(sys.argv) > 4 and sys.argv[4]:
+    u_sc["ENABLE_BACKGROUND_CHECK"] = sys.argv[4]
+    prompted_keys.add("ENABLE_BACKGROUND_CHECK")
+
+try:
+    with open(sys.argv[2], "r", encoding="utf-8", errors="surrogateescape") as f:
+        t_content = f.read()
+        t_lines = t_content.splitlines(keepends=True)
+        t_sc, t_ar = parse(t_content)
+except Exception as e:
+    print(f"Error reading configuration template: {e}", file=sys.stderr)
+    sys.exit(1)
+
+out = []
+in_arr = False
+skipping_arr = False
+arr_name = None
+migrated_scalars = set()
+migrated_arrays = set()
+written_scalars = set()
+written_arrays = set()
+
+is_tty = sys.stdout.isatty()
+BLUE = "\033[38;5;75m" if is_tty else ""
+GREEN = "\033[38;5;71m" if is_tty else ""
+YELLOW = "\033[38;5;214m" if is_tty else ""
+RED = "\033[38;5;196m" if is_tty else ""
+MAGENTA = "\033[38;5;176m" if is_tty else ""
+CYAN = "\033[38;5;79m" if is_tty else ""
+GRAY = "\033[38;5;244m" if is_tty else ""
+DIM = "\033[2m" if is_tty else ""
+BOLD = "\033[1m" if is_tty else ""
+RESET = "\033[0m" if is_tty else ""
+
+print(f"{BLUE}{BOLD}:: Commencing smart configuration migration...{RESET}")
+
+for line_raw in t_lines:
+    line = line_raw.strip()
+
+    if skipping_arr:
+        clean_line, temp = clean_comment_and_quotes(line)
+        if ")" in temp:
+            skipping_arr = False
+        continue
+
+    if in_arr:
+        clean_line, temp = clean_comment_and_quotes(line)
+        if ")" in temp:
+            el = u_ar.get(arr_name)
+            if el is not None:
+                default_el = t_ar.get(arr_name, [])
+                if norm_arr(el) == norm_arr(default_el):
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
+                else:
+                    if el:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    else:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                for item in el:
+                    out.append(f"    {item}\n")
+            else:
+                default_el = t_ar.get(arr_name, [])
+                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+            out.append(line_raw)
+            in_arr = False
+        else:
+            if arr_name not in u_ar:
+                out.append(line_raw)
+        continue
+
+    m_arr = re.match(r"^([A-Za-z0-9_]+)\s*(\+)?=\s*\((.*)", line)
+    if m_arr:
+        arr_name = m_arr.group(1)
+        clean_line, temp = clean_comment_and_quotes(line)
+        idx_paren = temp.find('(')
+        is_single_line = idx_paren != -1 and ")" in temp[idx_paren+1:]
+
+        if arr_name in written_arrays:
+            if not is_single_line:
+                skipping_arr = True
+            continue
+
+        written_arrays.add(arr_name)
+        out.append(line_raw)
+        migrated_arrays.add(arr_name)
+
+        if is_single_line:
+            el = u_ar.get(arr_name)
+            if el is not None:
+                out.pop()
+                out.append(f"{arr_name}=(\n")
+                default_el = t_ar.get(arr_name, [])
+                if norm_arr(el) == norm_arr(default_el):
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
+                else:
+                    if el:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    else:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                for item in el:
+                    out.append(f"    {item}\n")
+                out.append(")\n")
+            else:
+                default_el = t_ar.get(arr_name, [])
+                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+        else:
+            in_arr = True
+        continue
+
+    m_sc = re.match(r"^(\s*#\s*)?([A-Za-z0-9_]+)\s*(\+)?=\s*(.*)", line)
+    if m_sc:
+        k = m_sc.group(2)
+        is_commented = m_sc.group(1) is not None and m_sc.group(1).strip().startswith(chr(35))
+        if is_commented and k in t_sc:
+            out.append(line_raw)
+            continue
+        migrated_scalars.add(k)
+        if k in written_scalars:
+            if is_commented:
+                out.append(line_raw)
+            continue
+        if k in u_sc:
+            user_val = u_sc[k]
+            default_val = t_sc.get(k, "N/A")
+            if k in prompted_keys:
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Setting value '{user_val}' configured via user prompt.{RESET}")
+            elif user_val != default_val:
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
+            else:
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
+            out.append(f"{k}={user_val}\n")
+            written_scalars.add(k)
+            continue
+        else:
+            if is_commented:
+                out.append(line_raw)
+                continue
+            else:
+                default_val = t_sc.get(k, "N/A")
+                print(f"  {DIM}[Analyzing]{RESET} Option {MAGENTA}{k:<23}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
+                out.append(line_raw)
+                written_scalars.add(k)
+                continue
+
+    out.append(line_raw)
+
+protected_keys = {"ENABLE_BACKGROUND_CHECK"}
+orphans = (set(u_sc.keys()) - migrated_scalars) - prompted_keys - protected_keys
+orphan_arrays = set(u_ar.keys()) - migrated_arrays
+if orphans or orphan_arrays:
+    print(f"\n{YELLOW}{BOLD}:: Deprecated parameter cleanup:{RESET}")
+    for o in orphans:
+        print(f"  {DIM}[Analyzing]{RESET} Option {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
+    for o in orphan_arrays:
+        print(f"  {DIM}[Analyzing]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
+
+for p_key in sorted(prompted_keys | (protected_keys & set(u_sc.keys()))):
+    if p_key not in written_scalars and p_key in u_sc:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append(f"{p_key}={u_sc[p_key]}\n")
+        written_scalars.add(p_key)
+
+try:
+    fd = os.open(sys.argv[3], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+        f.writelines(out)
+except Exception as e:
+    print(f"Error writing configuration: {e}", file=sys.stderr)
+    sys.exit(1)
+EOF
+    py_exit=$?
+
+    if [[ $py_exit -eq 0 && -f "$reconf_tmp" ]]; then
+        mv "$reconf_tmp" "$real_settings_conf"
+        chmod 600 "$real_settings_conf"
+        if [[ "$reconf_was_trusted" == "true" && -f "$local_trust_file" ]]; then
+            local post_reconf_cmds_hash
+            post_reconf_cmds_hash=$(parse_bash_array "$real_settings_conf" "CUSTOM_CMDS" 2>/dev/null | sha256sum | cut -d' ' -f1)
+            if [[ "$post_reconf_cmds_hash" == "$pre_reconf_cmds_hash" ]]; then
+                sha256sum "$real_settings_conf" | cut -d' ' -f1 > "$local_trust_file"
+                chmod 600 "$local_trust_file" 2>/dev/null || true
+            else
+                rm -f "$local_trust_file"
+            fi
+        elif [[ -f "$local_trust_file" ]]; then
+            rm -f "$local_trust_file"
+        fi
+        if [[ "$restart_daemon" == "true" ]]; then
+            local ex_tag=""
+            local ex_ts=0
+            local ex_raw=""
+            local ex_raw_ts=""
+            if [[ -f "${CONFIG_DIR}/next_check.conf" ]]; then
+                ex_raw=$(cat "${CONFIG_DIR}/next_check.conf" 2>/dev/null || echo 0)
+                [[ "$ex_raw" == *"|"* ]] && ex_tag="${ex_raw#*|}"
+                ex_tag="${ex_tag#"${ex_tag%%[![:space:]]*}"}"
+                ex_tag="${ex_tag%"${ex_tag##*[![:space:]]}"}"
+                ex_raw_ts="${ex_raw%%|*}"
+                ex_raw_ts="${ex_raw_ts#"${ex_raw_ts%%[![:space:]]*}"}"
+                ex_raw_ts="${ex_raw_ts%"${ex_raw_ts##*[![:space:]]}"}"
+                [[ "$ex_raw_ts" =~ ^[0-9]+$ ]] && ex_ts=$(( 10#$ex_raw_ts ))
+            fi
+            if [[ "$ex_tag" != "silence" ]] || (( ex_ts <= $(date +%s) )); then
+                rm -f "${CONFIG_DIR}/next_check.conf"
+            fi
+        else
+            rm -f "${CONFIG_DIR}/next_check.conf"
+        fi
+        echo -e "\n${green}Smart configuration migration completed successfully.${reset}"
+    else
+        echo -e "${red}Error: Failed to process and merge configuration files.${reset}"
+        rm -f "$reconf_tmp" 2>/dev/null || true
+        release_state_lock
+        exit 1
+    fi
+
+    if [[ -n "${real_settings_conf:-}" && -f "$real_settings_conf" ]]; then
+        if ! validate_user_conf "$real_settings_conf" "settings.conf"; then
+            echo -e "${red}Error: settings.conf validation failed after reconfiguration.${reset}"
+            SETTINGS_VALIDATION_FAILED=true
+            release_state_lock
+            exit 1
+        fi
+        load_daemon_params "$real_settings_conf"
+    fi
+
+    if [[ "$restart_daemon" == "true" ]]; then
+        if [[ ! -f "$DAEMON_TEMPLATE" ]]; then
+            echo -e "${yellow}Warning: Missing daemon.template. Background service could not be started.${reset}"
+        else
+            ENABLE_BACKGROUND_CHECK="true"
+            sync_daemon_state "true"
+            if command -v systemctl >/dev/null 2>&1; then
+                if ! systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null; then
+                    echo -e "${yellow}Warning: Background timer was configured, but failed to activate via systemd.${reset}"
+                fi
+            fi
+            if ! pacman -Q libnotify >/dev/null 2>&1; then
+                echo -e "${yellow}Notice: 'libnotify' is not installed. Desktop notifications may not appear.${reset}"
+            fi
+        fi
+    else
+        ENABLE_BACKGROUND_CHECK="false"
+        sync_daemon_state "false"
+    fi
+
+    release_state_lock
+    exit 0
+}
+
+# --- 3. CLI Action Dispatch ---
+if [[ "${1:-}" == "--notify-worker" ]]; then
+    handle_notify_worker "$@"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--news-worker" ]]; then
+    handle_news_worker "$@"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--reconfigure" ]]; then
+    handle_reconfigure
+fi
+
+if [[ "${1:-}" == "--enable-daemon" || "${1:-}" == "--start-daemon" ]]; then
+    handle_enable_daemon
+fi
+
+if [[ "${1:-}" == "--disable-daemon" || "${1:-}" == "--stop-daemon" ]]; then
+    handle_disable_daemon
+fi
+
+if [[ "${1:-}" == "--silence" || "${1:-}" == "--snooze" || "${1:-}" == --silence=* || "${1:-}" == --snooze=* ]]; then
+    silence_opt=""
+    if [[ "${1:-}" == *"="* ]]; then
+        silence_opt="${1#*=}"
+    elif (( $# >= 2 )); then
+        silence_opt="${2:-}"
+    fi
+    handle_silence "$silence_opt"
+fi
+
+# --- 4. Runtime Configuration & Daemon Sync ---
 mkdir -p "$CONFIG_DIR"
 
 if ! $DAEMON_MODE; then
@@ -1203,46 +2180,11 @@ if ! $DAEMON_MODE; then
             touch "$CONFIG_DIR/.snapper_warned" 2>/dev/null
         fi
     fi
-fi
-
-echo -e "${dim}Checking for configuration updates...${reset}"
-
-if curl -sI --connect-timeout 2 --max-time 4 "https://raw.githubusercontent.com" >/dev/null 2>&1; then
-    manifest_updated=false
-    create_temp_file MANIFEST_TMP "manifest"
-    manifest_url="https://raw.githubusercontent.com/motorrin/arch-smart-update/main/manifest.sha256"
-    manifest_target=$(bypass_cdn_cache "$manifest_url")
-    if curl -sLfo "$MANIFEST_TMP" --connect-timeout 2 --max-time 4 "$manifest_target"; then
-        if grep -qE '^[a-f0-9]{64}[[:space:]]+' "$MANIFEST_TMP"; then
-            mv "$MANIFEST_TMP" "$CONFIG_DIR/manifest.sha256"
-            MANIFEST_TMP=""
-            manifest_updated=true
-        else
-            rm -f "$MANIFEST_TMP"
-            MANIFEST_TMP=""
-            echo -e "${yellow}Warning: Downloaded manifest has an invalid format. Skipping config updates to prevent verification failures.${reset}"
-        fi
-    else
-        rm -f "$MANIFEST_TMP"
-        MANIFEST_TMP=""
-        echo -e "${yellow}Warning: Failed to update manifest.sha256. Skipping config updates to prevent verification failures.${reset}"
-    fi
-
-    if [[ -f "$CONFIG_DIR/manifest.sha256" ]]; then
-        if [ "$manifest_updated" = true ] || [ ! -f "$PKG_CONF" ] || [ ! -f "$SETTINGS_DEFAULT" ] || [ ! -f "$DAEMON_TEMPLATE" ] || [ ! -f "$ICON_PATH" ]; then
-            update_from_github "$PKG_CONF" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/packages.conf" "NUCLEAR_PKGS"
-            update_from_github "$SETTINGS_DEFAULT" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/settings.conf" "PROMPT_MIRROR_REFRESH"
-            update_from_github "$DAEMON_TEMPLATE" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/daemon.template" "[TimerTemplate]"
-            update_from_github "$ICON_PATH" "https://raw.githubusercontent.com/motorrin/arch-smart-update/main/ASU.png" ""
-        fi
-    else
-        echo -e "${red}Error: No local manifest available. Skipping configuration updates for security.${reset}"
-    fi
+    echo -e "${dim}Checking for configuration updates...${reset}"
+    ensure_asu_base_configs "true"
 else
-    echo -e "${dim}GitHub is unreachable. Skipping configuration updates...${reset}"
+    ensure_asu_base_configs "false" >/dev/null 2>&1 || true
 fi
-
-[[ -f "$ICON_PATH" ]] && chmod 644 "$ICON_PATH" 2>/dev/null
 
 if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
     cp "$SETTINGS_DEFAULT" "$SETTINGS_CONF"
@@ -1271,18 +2213,20 @@ if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
     fi
 
     if [[ "$daemon_ans" =~ ^[Yy]$ ]]; then
-        sed -i 's/^ENABLE_BACKGROUND_CHECK=.*/ENABLE_BACKGROUND_CHECK=true/' "$SETTINGS_CONF"
-        echo -e "${dim}Background checker enabled.${reset}"
-        echo -e "${yellow}Note: If CUSTOM_CMDS is active in settings.conf, making any subsequent${reset}"
-        echo -e "${yellow}changes to your settings file requires running this script manually once.${reset}"
-        if ! pacman -Q libnotify >/dev/null 2>&1; then
-            echo -e "\n${yellow}Warning: The ${red}libnotify${yellow} package is not installed. Please install it for notifications to work.${reset}\n"
+        if write_bg_check_setting "$SETTINGS_CONF" "true"; then
+            echo -e "${dim}Background checker enabled.${reset}\n"
+            if ! pacman -Q libnotify >/dev/null 2>&1; then
+                echo -e "${yellow}Warning: The ${red}libnotify${yellow} package is not installed. Please install it for notifications to work.${reset}\n"
+            fi
         else
-            echo ""
+            echo -e "${red}Warning: Failed to update background checker setting in configuration file.${reset}\n"
         fi
     else
-        sed -i 's/^ENABLE_BACKGROUND_CHECK=.*/ENABLE_BACKGROUND_CHECK=false/' "$SETTINGS_CONF"
-        echo -e "${dim}Background checker disabled.${reset}\n"
+        if write_bg_check_setting "$SETTINGS_CONF" "false"; then
+            echo -e "${dim}Background checker disabled.${reset}\n"
+        else
+            echo -e "${red}Warning: Failed to update background checker setting in configuration file.${reset}\n"
+        fi
     fi
 
     if [[ "$clean_ans" =~ ^[Yy]$ ]]; then
@@ -1300,6 +2244,8 @@ if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
         sed -i 's/^GENERATE_LOGS=.*/GENERATE_LOGS=false/' "$SETTINGS_CONF"
         echo -e "${dim}Log generation disabled.${reset}\n"
     fi
+
+    chmod 600 "$SETTINGS_CONF" 2>/dev/null || true
 fi
 
 SETTINGS_VALIDATION_FAILED=false
@@ -1314,225 +2260,19 @@ if ! validate_user_conf "$PKG_CONF" "packages.conf"; then
     PKG_CONF=""
 fi
 
-if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
-    has_new_features=false
-    while read -r key; do
-        if [[ -n "$key" ]] && ! grep -qE "^[[:space:]]*(#)?[[:space:]]*${key}[[:space:]]*(\+)?=" "$SETTINGS_CONF"; then
-            has_new_features=true
-            break
-        fi
-    done < <(grep -E '^[A-Za-z0-9_]+[[:space:]]*(\+)?=' "$SETTINGS_DEFAULT" | cut -d= -f1 | sed -E 's/\+//g; s/[[:space:]]+$//' | tr -d '\r')
-
-    if [[ "$has_new_features" == "true" && "$DAEMON_MODE" == "false" ]]; then
-        echo -e "${yellow}Notice: Your settings.conf may be missing newer configuration options present in settings.default.conf.${reset}"
-        echo -e "${dim}It is recommended to run this script with ${white}--reconfigure${dim} to regenerate your settings and configure new options.${reset}\n"
+if [[ "$DAEMON_MODE" == true && "${SETTINGS_VALIDATION_FAILED:-false}" == "true" ]]; then
+    log_step "Error: settings.conf failed verification. Aborting."
+    if command -v notify-send >/dev/null 2>&1; then
+        notif_icon="dialog-error"
+        [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
+        launch_detached notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" "Security Alert: Background Monitor Paused" "Unverified changes detected in settings.conf. Please run this script manually in a terminal to authorize them."
     fi
+    exit 1
 fi
-
-NUCLEAR_PKGS=("glibc" "linux" "systemd" "pacman" "nvidia" "mkinitcpio")
-CRITICAL_PKGS=("base" "base-devel" "mesa" "wayland" "xorg-server" "dbus")
-FEATURE_PKGS=("pipewire" "plasma-desktop" "gnome-shell" "hyprland" "networkmanager")
-CUSTOM_CMDS=()
-
-if [[ -f "$PKG_CONF" ]]; then
-    mapfile -t NUCLEAR_PKGS < <(parse_bash_array "$PKG_CONF" "NUCLEAR_PKGS")
-    mapfile -t CRITICAL_PKGS < <(parse_bash_array "$PKG_CONF" "CRITICAL_PKGS")
-    mapfile -t FEATURE_PKGS < <(parse_bash_array "$PKG_CONF" "FEATURE_PKGS")
-else
-    echo -e "${red}Could not load packages.conf. Using built-in basic fallbacks.${reset}"
-fi
-
-ENABLE_BACKGROUND_CHECK=false
-ENABLE_POST_CLEANUP=false
-ENABLE_AUR_REBUILD_CHECK=true
-MIN_DISK_SPACE_MB=2048
-MIN_BTRFS_SPACE_MB=4608
-CHECK_INTERVAL=30min
-START_DELAY=5min
-GENERATE_LOGS=false
-MAX_LOG_NUMBERS=5
-T_MIRROR_H=3
-T_FEAT_H=6
-T_CRIT_H=12
-T_DE_H=12
-T_NUKE_H=24
-IGNORE_PATCH_TIMERS=true
-# shellcheck disable=SC2034
-SILENCE_UPDATES=6h
-# shellcheck disable=SC2034
-NOTIFICATION_TIMEOUT=30000
-PROMPT_MIRROR_REFRESH=false
-AUR_HELPER_OVERRIDE=""
-CUSTOM_RATE_MIRRORS_CMD=""
-CUSTOM_REFLECTOR_CMD=""
-MAX_BACKUP_COPIES=5
 
 if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
-    while IFS= read -r line; do
-        line="${line%$'\r'}"
-        line="${line%%[[:space:]]#*}"
-        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
-            key="${BASH_REMATCH[1]}"
-            val="${BASH_REMATCH[2]}"
-            val="${val%"${val##*[![:space:]]}"}"
-            if [[ "$val" =~ ^\"(.*)\"$ || "$val" =~ ^\'(.*)\'$ ]]; then
-                val="${BASH_REMATCH[1]}"
-            fi
-            case "$key" in
-                AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_RATE_MIRRORS_CMD|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP|ENABLE_AUR_REBUILD_CHECK|MIN_DISK_SPACE_MB|MIN_BTRFS_SPACE_MB|SILENCE_UPDATES|NOTIFICATION_TIMEOUT)
-                    declare -g "$key=$val"
-                    ;;
-            esac
-        fi
-    done < "$SETTINGS_CONF"
-
-    mapfile -t USER_NUKE < <(parse_bash_array "$SETTINGS_CONF" "USER_NUCLEAR_PKGS")
-    [[ ${#USER_NUKE[@]} -gt 0 ]] && NUCLEAR_PKGS+=("${USER_NUKE[@]}")
-
-    mapfile -t USER_CRIT < <(parse_bash_array "$SETTINGS_CONF" "USER_CRITICAL_PKGS")
-    [[ ${#USER_CRIT[@]} -gt 0 ]] && CRITICAL_PKGS+=("${USER_CRIT[@]}")
-
-    mapfile -t USER_FEAT < <(parse_bash_array "$SETTINGS_CONF" "USER_FEATURE_PKGS")
-    [[ ${#USER_FEAT[@]} -gt 0 ]] && FEATURE_PKGS+=("${USER_FEAT[@]}")
-
-    mapfile -t CUSTOM_CMDS < <(parse_bash_array "$SETTINGS_CONF" "CUSTOM_CMDS")
-
-    [[ "$T_MIRROR_H" =~ ^[0-9]+$ ]] || T_MIRROR_H=3
-    [[ "$T_FEAT_H" =~ ^[0-9]+$ ]] || T_FEAT_H=6
-    [[ "$T_CRIT_H" =~ ^[0-9]+$ ]] || T_CRIT_H=12
-    [[ "$T_DE_H" =~ ^[0-9]+$ ]] || T_DE_H=12
-    [[ "$T_NUKE_H" =~ ^[0-9]+$ ]] || T_NUKE_H=24
-    [[ "$MIN_DISK_SPACE_MB" =~ ^[0-9]+$ ]] || MIN_DISK_SPACE_MB=2048
-    [[ "$MIN_BTRFS_SPACE_MB" =~ ^[0-9]+$ ]] || MIN_BTRFS_SPACE_MB=4608
+    load_daemon_params "$SETTINGS_CONF"
 fi
-
-declare -A NUKE_MAP
-for pkg in "${NUCLEAR_PKGS[@]+"${NUCLEAR_PKGS[@]}"}"; do NUKE_MAP["$pkg"]=1; done
-
-declare -A CRIT_MAP
-for pkg in "${CRITICAL_PKGS[@]+"${CRITICAL_PKGS[@]}"}"; do CRIT_MAP["$pkg"]=1; done
-
-declare -A FEAT_MAP
-for pkg in "${FEATURE_PKGS[@]+"${FEATURE_PKGS[@]}"}"; do FEAT_MAP["$pkg"]=1; done
-
-sync_daemon_state() {
-    if [[ "${SETTINGS_VALIDATION_FAILED:-false}" == "true" ]]; then
-        return 0
-    fi
-
-    local QUIET=false
-    [[ "$DAEMON_MODE" == true ]] && QUIET=true
-
-    local SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$USER_HOME/.config}/systemd/user"
-
-    if [[ "${ENABLE_BACKGROUND_CHECK,,}" == "true" ]]; then
-        if ! command -v fakeroot >/dev/null 2>&1; then
-            $QUIET || echo -e "${yellow}Background check requires 'fakeroot' (install base-devel). Disabling daemon.${reset}"
-            ENABLE_BACKGROUND_CHECK="false"
-            if command -v systemctl >/dev/null 2>&1; then
-                if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null || [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" ]]; then
-                    systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
-                    rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
-                    systemctl --user daemon-reload >/dev/null 2>&1
-                fi
-            fi
-            return 0
-        fi
-
-        if ! command -v systemctl >/dev/null 2>&1; then
-            $QUIET || echo -e "${yellow}Notice: systemctl not found (non-systemd system).${reset}"
-            $QUIET || echo -e "${dim}To use the background checker, please manually schedule a cron job for: ${reset}${white}$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")") --daemon${reset}"
-            return 0
-        fi
-
-        mkdir -p "$SYSTEMD_USER_DIR"
-
-        if [[ -f "$DAEMON_TEMPLATE" ]]; then
-            local SCRIPT_PATH TMP_SVC TMP_TMR
-            SCRIPT_PATH="$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")")"
-            create_temp_file TMP_SVC "asu_svc"
-            create_temp_file TMP_TMR "asu_tmr"
-
-            local CURRENT_INTERVAL="$CHECK_INTERVAL"
-            local NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
-            local lock_file="$CONFIG_DIR/.state.lock"
-
-            if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-                if flock -w 5 -x 200 2>/dev/null; then
-                    if [[ -f "$NEXT_CHECK_FILE" ]]; then
-                        local file_mtime
-                        file_mtime=$(stat -c %Y "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
-                        local boot_ts
-                        boot_ts=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null || echo 0)
-
-                        if (( file_mtime > 0 && boot_ts > 0 && file_mtime < boot_ts )); then
-                            rm -f "$NEXT_CHECK_FILE"
-                        fi
-                    fi
-
-                    if [[ -f "$NEXT_CHECK_FILE" ]]; then
-                        local next_ts
-                        next_ts=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
-                        local now_ts
-                        now_ts=$(date +%s)
-
-                        if [[ "$next_ts" =~ ^[0-9]+$ ]] && (( next_ts > now_ts )); then
-                            local diff_m=$(( (next_ts - now_ts) / 60 + 1 ))
-                            CURRENT_INTERVAL="${diff_m}min"
-                        else
-                            rm -f "$NEXT_CHECK_FILE"
-                        fi
-                    fi
-                fi
-                exec 200>&- 2>/dev/null || true
-            fi
-
-            export SCRIPT_PATH START_DELAY CURRENT_INTERVAL
-            awk -v svc="$TMP_SVC" -v tmr="$TMP_TMR" '
-                BEGIN {
-                    script = ENVIRON["SCRIPT_PATH"]
-                    delay = ENVIRON["START_DELAY"]
-                    interval = ENVIRON["CURRENT_INTERVAL"]
-                }
-                /^\[TimerTemplate\]/ { in_timer=1; next }
-                {
-                    while ((idx = index($0, "__SCRIPT_PATH__")) > 0)
-                        $0 = substr($0, 1, idx - 1) "\"" script "\"" substr($0, idx + 15)
-                    while ((idx = index($0, "__START_DELAY__")) > 0)
-                        $0 = substr($0, 1, idx - 1) delay substr($0, idx + 15)
-                    while ((idx = index($0, "__CHECK_INTERVAL__")) > 0)
-                        $0 = substr($0, 1, idx - 1) interval substr($0, idx + 18)
-
-                    if (in_timer) print > tmr
-                    else print > svc
-                }
-            ' "$DAEMON_TEMPLATE"
-
-            if [[ ! -s "$TMP_SVC" || ! -s "$TMP_TMR" ]]; then
-                rm -f "$TMP_SVC" "$TMP_TMR"
-                $QUIET || echo -e "${yellow}Warning: Failed to generate systemd units from template.${reset}"
-            elif ! cmp -s "$TMP_SVC" "$SYSTEMD_USER_DIR/arch-smart-update.service" || ! cmp -s "$TMP_TMR" "$SYSTEMD_USER_DIR/arch-smart-update.timer"; then
-                mv "$TMP_SVC" "$SYSTEMD_USER_DIR/arch-smart-update.service"
-                mv "$TMP_TMR" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
-                chmod 644 "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
-                systemctl --user daemon-reload >/dev/null 2>&1
-                systemctl --user enable --now arch-smart-update.timer >/dev/null 2>&1
-            else
-                rm -f "$TMP_SVC" "$TMP_TMR"
-            fi
-        fi
-    else
-        if command -v systemctl >/dev/null 2>&1; then
-            if systemctl --user is-active --quiet arch-smart-update.timer 2>/dev/null || [[ -f "$SYSTEMD_USER_DIR/arch-smart-update.timer" ]]; then
-                systemctl --user disable --now arch-smart-update.timer >/dev/null 2>&1
-                rm -f "$SYSTEMD_USER_DIR/arch-smart-update.service" "$SYSTEMD_USER_DIR/arch-smart-update.timer"
-                systemctl --user daemon-reload >/dev/null 2>&1
-            fi
-        fi
-    fi
-}
-
-sync_daemon_state
 
 if [[ "$DAEMON_MODE" == true ]]; then
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$EUID}"
@@ -1625,36 +2365,120 @@ if [[ "$DAEMON_MODE" == true ]]; then
         unset DISPLAY
     fi
 
-    if [[ "${SETTINGS_VALIDATION_FAILED:-false}" == "true" ]]; then
-        log_step "Error: settings.conf failed verification. Aborting."
-        if command -v notify-send >/dev/null 2>&1; then
-            notif_icon="dialog-error"
-            [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
-            launch_detached notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" "Security Alert: Background Monitor Paused" "Unverified changes detected in settings.conf. Please run this script manually in a terminal to authorize them."
-        fi
-        exit 1
-    fi
-
     NEXT_CHECK_FILE="$CONFIG_DIR/next_check.conf"
     if [[ "${1:-}" == "--daemon" ]] && [[ -f "$NEXT_CHECK_FILE" ]]; then
-        lock_file="$CONFIG_DIR/.state.lock"
         NEXT_TS=0
-        if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-            if flock -w 5 -s 200 2>/dev/null; then
-                NEXT_TS=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+        raw_next=""
+        existing_tag=""
+        file_mtime=0
+        boot_ts=0
+        if acquire_state_lock "x"; then
+            if [[ -f "$NEXT_CHECK_FILE" ]]; then
+                file_mtime=$(stat -c %Y "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+                boot_ts=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null || echo 0)
+                raw_next=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+                NEXT_TS="${raw_next%%|*}"
+                NEXT_TS="${NEXT_TS#"${NEXT_TS%%[![:space:]]*}"}"
+                NEXT_TS="${NEXT_TS%"${NEXT_TS##*[![:space:]]}"}"
+                if [[ "$raw_next" == *"|"* ]]; then
+                    existing_tag="${raw_next#*|}"
+                    existing_tag="${existing_tag#"${existing_tag%%[![:space:]]*}"}"
+                    existing_tag="${existing_tag%"${existing_tag##*[![:space:]]}"}"
+                fi
+                if (( file_mtime > 0 && boot_ts > 0 && file_mtime < boot_ts )) && [[ "$existing_tag" != "silence" ]]; then
+                    rm -f "$NEXT_CHECK_FILE"
+                    NEXT_TS=0
+                fi
             fi
-            exec 200>&- 2>/dev/null || true
-        else
-            NEXT_TS=$(cat "$NEXT_CHECK_FILE" 2>/dev/null || echo 0)
+            release_state_lock
         fi
         NOW_TS=$(date +%s)
-        if [[ "$NEXT_TS" =~ ^[0-9]+$ ]] && (( NEXT_TS > NOW_TS + 300 )); then
-            target_time=$(date -d "@$NEXT_TS" +%H:%M || echo "00:00")
+        if [[ "$NEXT_TS" =~ ^[0-9]+$ ]] && (( NEXT_TS > NOW_TS + 30 )); then
+            target_time=$(date -d "@$NEXT_TS" +%H:%M 2>/dev/null || echo "00:00")
             log_step "Scheduled check is in the future ($target_time). Woke up early. Exiting."
             exit 0
         fi
     fi
 fi
+
+if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
+    has_new_features=false
+    while read -r key; do
+        if [[ -n "$key" ]] && ! grep -qE "^[[:space:]]*(#)?[[:space:]]*${key}[[:space:]]*(\+)?=" "$SETTINGS_CONF"; then
+            has_new_features=true
+            break
+        fi
+    done < <(grep -E '^[A-Za-z0-9_]+[[:space:]]*(\+)?=' "$SETTINGS_DEFAULT" | cut -d= -f1 | sed -E 's/\+//g; s/[[:space:]]+$//' | tr -d '\r')
+
+    if [[ "$has_new_features" == "true" && "$DAEMON_MODE" == "false" ]]; then
+        echo -e "${yellow}Notice: Your settings.conf may be missing newer configuration options present in settings.default.conf.${reset}"
+        echo -e "${dim}It is recommended to run this script with ${white}--reconfigure${dim} to regenerate your settings and configure new options.${reset}\n"
+    fi
+fi
+
+if [[ -f "$PKG_CONF" ]]; then
+    mapfile -t NUCLEAR_PKGS < <(parse_bash_array "$PKG_CONF" "NUCLEAR_PKGS")
+    mapfile -t CRITICAL_PKGS < <(parse_bash_array "$PKG_CONF" "CRITICAL_PKGS")
+    mapfile -t FEATURE_PKGS < <(parse_bash_array "$PKG_CONF" "FEATURE_PKGS")
+else
+    echo -e "${red}Could not load packages.conf. Using built-in basic fallbacks.${reset}"
+fi
+
+if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line%%[[:space:]]#*}"
+        if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=[[:space:]]*(.*)$ ]]; then
+            key="${BASH_REMATCH[1]}"
+            val="${BASH_REMATCH[2]}"
+            val="${val#"${val%%[![:space:]]*}"}"
+            val="${val%"${val##*[![:space:]]}"}"
+            if [[ "$val" =~ ^\"(.*)\"[[:space:]]*(#.*)?$ || "$val" =~ ^\'(.*)\'[[:space:]]*(#.*)?$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            else
+                val="${val%%#*}"
+                val="${val%"${val##*[![:space:]]}"}"
+            fi
+            case "$key" in
+                AUR_HELPER_OVERRIDE|PROMPT_MIRROR_REFRESH|MAX_BACKUP_COPIES|CHECK_INTERVAL|START_DELAY|ENABLE_BACKGROUND_CHECK|T_MIRROR_H|T_FEAT_H|T_CRIT_H|T_DE_H|T_NUKE_H|IGNORE_PATCH_TIMERS|GENERATE_LOGS|MAX_LOG_NUMBERS|CUSTOM_RATE_MIRRORS_CMD|CUSTOM_REFLECTOR_CMD|ENABLE_POST_CLEANUP|ENABLE_AUR_REBUILD_CHECK|MIN_DISK_SPACE_MB|MIN_BTRFS_SPACE_MB|SILENCE_UPDATES|NOTIFICATION_TIMEOUT)
+                    declare -g "$key=$val"
+                    ;;
+            esac
+        fi
+    done < "$SETTINGS_CONF"
+
+    mapfile -t USER_NUKE < <(parse_bash_array "$SETTINGS_CONF" "USER_NUCLEAR_PKGS")
+    [[ ${#USER_NUKE[@]} -gt 0 ]] && NUCLEAR_PKGS+=("${USER_NUKE[@]}")
+
+    mapfile -t USER_CRIT < <(parse_bash_array "$SETTINGS_CONF" "USER_CRITICAL_PKGS")
+    [[ ${#USER_CRIT[@]} -gt 0 ]] && CRITICAL_PKGS+=("${USER_CRIT[@]}")
+
+    mapfile -t USER_FEAT < <(parse_bash_array "$SETTINGS_CONF" "USER_FEATURE_PKGS")
+    [[ ${#USER_FEAT[@]} -gt 0 ]] && FEATURE_PKGS+=("${USER_FEAT[@]}")
+
+    mapfile -t CUSTOM_CMDS < <(parse_bash_array "$SETTINGS_CONF" "CUSTOM_CMDS")
+
+    [[ "$T_MIRROR_H" =~ ^[0-9]+$ ]] || T_MIRROR_H="$DEFAULT_T_MIRROR_H"
+    [[ "$T_FEAT_H" =~ ^[0-9]+$ ]] || T_FEAT_H="$DEFAULT_T_FEAT_H"
+    [[ "$T_CRIT_H" =~ ^[0-9]+$ ]] || T_CRIT_H="$DEFAULT_T_CRIT_H"
+    [[ "$T_DE_H" =~ ^[0-9]+$ ]] || T_DE_H="$DEFAULT_T_DE_H"
+    [[ "$T_NUKE_H" =~ ^[0-9]+$ ]] || T_NUKE_H="$DEFAULT_T_NUKE_H"
+    [[ "$MIN_DISK_SPACE_MB" =~ ^[0-9]+$ ]] || MIN_DISK_SPACE_MB="$DEFAULT_MIN_DISK_SPACE_MB"
+    [[ "$MIN_BTRFS_SPACE_MB" =~ ^[0-9]+$ ]] || MIN_BTRFS_SPACE_MB="$DEFAULT_MIN_BTRFS_SPACE_MB"
+    [[ -z "${CHECK_INTERVAL:-}" ]] && CHECK_INTERVAL="$DEFAULT_CHECK_INTERVAL"
+    [[ -z "${START_DELAY:-}" ]] && START_DELAY="$DEFAULT_START_DELAY"
+    [[ -z "${SILENCE_UPDATES:-}" ]] && SILENCE_UPDATES="$DEFAULT_SILENCE_UPDATES"
+    parse_timeout_to_ms "${NOTIFICATION_TIMEOUT:-$DEFAULT_NOTIFICATION_TIMEOUT}" NOTIFICATION_TIMEOUT "$DEFAULT_NOTIFICATION_TIMEOUT"
+fi
+
+declare -A NUKE_MAP
+for pkg in "${NUCLEAR_PKGS[@]+"${NUCLEAR_PKGS[@]}"}"; do NUKE_MAP["$pkg"]=1; done
+
+declare -A CRIT_MAP
+for pkg in "${CRITICAL_PKGS[@]+"${CRITICAL_PKGS[@]}"}"; do CRIT_MAP["$pkg"]=1; done
+
+declare -A FEAT_MAP
+for pkg in "${FEATURE_PKGS[@]+"${FEATURE_PKGS[@]}"}"; do FEAT_MAP["$pkg"]=1; done
 
 if [[ "${GENERATE_LOGS,,}" == "true" ]]; then
     LOG_DIR="$CONFIG_DIR/logs"
@@ -1691,8 +2515,8 @@ if [[ "${GENERATE_LOGS,,}" == "true" ]]; then
         exec > >(tee -a "$LOG_FILE") 2>&1
     fi
 
-    SANITIZED_MAX_LOGS=${MAX_LOG_NUMBERS:-5}
-    [[ "$SANITIZED_MAX_LOGS" =~ ^[0-9]+$ ]] || SANITIZED_MAX_LOGS=5
+    SANITIZED_MAX_LOGS=${MAX_LOG_NUMBERS:-$DEFAULT_MAX_LOG_NUMBERS}
+    [[ "$SANITIZED_MAX_LOGS" =~ ^[0-9]+$ ]] || SANITIZED_MAX_LOGS="$DEFAULT_MAX_LOG_NUMBERS"
 
     mapfile -t existing_logs < <(find "$LOG_DIR" -maxdepth 1 -name "${log_prefix}_*" 2>/dev/null | grep -E "/${log_prefix}_[0-9]+$" | sort -V)
     if (( ${#existing_logs[@]} > SANITIZED_MAX_LOGS )); then
@@ -1703,7 +2527,9 @@ if [[ "${GENERATE_LOGS,,}" == "true" ]]; then
     fi
 fi
 
-# --- 3. Temporary Files ---
+sync_daemon_state
+
+# --- 5. Temporary Files ---
 create_temp_file OUTPUT_FILE "asu_out"
 create_temp_file SYNC_LOG "asu_sync"
 create_temp_file REFL_LOG "asu_refl"
@@ -1711,7 +2537,7 @@ create_temp_file REFL_LOG "asu_refl"
 create_temp_dir CHECK_DB "checkupdates-db"
 chmod 755 "$CHECK_DB"
 
-# --- 4. Helper Functions ---
+# --- 6. Helper Functions ---
 get_update_type() {
     local old="${1:-}"
     local new="${2:-}"
@@ -1933,8 +2759,8 @@ EOF
 
 backup_pacman_db() {
     local BACKUP_DIR="/var/lib/pacman/backup"
-    local KEEP_COPIES=${MAX_BACKUP_COPIES:-5}
-    [[ "$KEEP_COPIES" =~ ^[0-9]+$ ]] || KEEP_COPIES=5
+    local KEEP_COPIES=${MAX_BACKUP_COPIES:-$DEFAULT_MAX_BACKUP_COPIES}
+    [[ "$KEEP_COPIES" =~ ^[0-9]+$ ]] || KEEP_COPIES="$DEFAULT_MAX_BACKUP_COPIES"
     log_step "Creating Pacman DB backup..."
     if [[ ! -d "$BACKUP_DIR" ]]; then
         sudo mkdir -p "$BACKUP_DIR"
@@ -2140,9 +2966,9 @@ check_disk_space() {
         has_snaps=true
     fi
 
-    local min_space_mb=${MIN_DISK_SPACE_MB:-2048}
+    local min_space_mb=${MIN_DISK_SPACE_MB:-$DEFAULT_MIN_DISK_SPACE_MB}
     if [[ "$is_btrfs" == "true" || "$has_snaps" == "true" ]]; then
-        min_space_mb=${MIN_BTRFS_SPACE_MB:-4608}
+        min_space_mb=${MIN_BTRFS_SPACE_MB:-$DEFAULT_MIN_BTRFS_SPACE_MB}
     fi
 
     if [[ -n "${total_download_size:-}" ]]; then
@@ -2369,6 +3195,34 @@ get_current_mirror() {
     echo "${mirror:-Unknown}"
 }
 
+run_refl_and_check() {
+    local cmd="$1"
+
+    bash -o pipefail -c "$cmd" 2>&1 | tee "$REFL_LOG"
+    local exit_code=${PIPESTATUS[0]}
+
+    local err_count
+    err_count=$(grep -cEi "warning: failed to rate|timed out|error" "$REFL_LOG" 2>/dev/null || true)
+
+    if [[ $exit_code -ne 0 ]] && (( err_count >= 15 )); then
+        echo -e "\n${yellow}Mirror ranker encountered problems: $err_count mirrors are unavailable or timed out.${reset}"
+        echo -e "${yellow}The connection might be unstable, or the mirrors are currently down.${reset}"
+
+        local force_cont
+        echo -ne "${white}Continue with the old mirrorlist anyway? [y/N]: ${reset}"
+        read -r force_cont
+
+        if [[ ! "$force_cont" =~ ^[Yy]$ ]]; then
+            echo -e "${red}The update was interrupted by the user.${reset}"
+            exit 1
+        fi
+
+        return 255
+    fi
+
+    return "$exit_code"
+}
+
 refresh_mirrors() {
     if [[ "$DAEMON_MODE" == true ]]; then
         return 1
@@ -2449,34 +3303,6 @@ refresh_mirrors() {
             fi
 
             local REFL_SUCCESS=false
-
-            run_refl_and_check() {
-                local cmd="$1"
-
-                bash -o pipefail -c "$cmd" 2>&1 | tee "$REFL_LOG"
-                local exit_code=${PIPESTATUS[0]}
-
-                local err_count
-                err_count=$(grep -cEi "warning: failed to rate|timed out|error" "$REFL_LOG" 2>/dev/null || true)
-
-                if [[ $exit_code -ne 0 ]] && (( err_count >= 15 )); then
-                    echo -e "\n${yellow}Mirror ranker encountered problems: $err_count mirrors are unavailable or timed out.${reset}"
-                    echo -e "${yellow}The connection might be unstable, or the mirrors are currently down.${reset}"
-
-                    local force_cont
-                    echo -ne "${white}Continue with the old mirrorlist anyway? [y/N]: ${reset}"
-                    read -r force_cont
-
-                    if [[ ! "$force_cont" =~ ^[Yy]$ ]]; then
-                        echo -e "${red}The update was interrupted by the user.${reset}"
-                        exit 1
-                    fi
-
-                    return 255
-                fi
-
-                return "$exit_code"
-            }
 
             if [[ -n "$CUSTOM_RM" ]]; then
                 echo -e "\n${blue}Running custom rate-mirrors command...${reset}"
@@ -2571,46 +3397,40 @@ refresh_mirrors() {
 
 handle_daemon_sync_fail() {
     if [[ "$DAEMON_MODE" == true ]]; then
-        local lock_file="$CONFIG_DIR/.state.lock"
-        if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-            if flock -w 5 -x 200 2>/dev/null; then
-                local count_file="$CONFIG_DIR/sync_failures.count"
-                local count=0
-                if [[ -f "$count_file" ]]; then
-                    count=$(cat "$count_file" 2>/dev/null || echo 0)
-                fi
-                if [[ ! "$count" =~ ^[0-9]+$ ]]; then
-                    count=0
-                fi
-                count=$((count + 1))
-                echo "$count" > "$count_file"
-                if (( count > 0 && count % 3 == 0 )); then
-                    if command -v notify-send >/dev/null 2>&1; then
-                        local notif_icon="dialog-error"
-                        [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
-                        launch_detached notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" \
-                            "Connection Warning" "Failed to connect to mirrors 3 times consecutively."
-                    fi
+        if acquire_state_lock "x"; then
+            local count_file="$CONFIG_DIR/sync_failures.count"
+            local count=0
+            if [[ -f "$count_file" ]]; then
+                count=$(cat "$count_file" 2>/dev/null || echo 0)
+            fi
+            if [[ ! "$count" =~ ^[0-9]+$ ]]; then
+                count=0
+            fi
+            count=$((count + 1))
+            echo "$count" > "$count_file"
+            if (( count > 0 && count % 3 == 0 )); then
+                if command -v notify-send >/dev/null 2>&1; then
+                    local notif_icon="dialog-error"
+                    [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
+                    launch_detached notify-send -a "Arch Smart Update" -u critical -i "$notif_icon" \
+                        "Connection Warning" "Failed to connect to mirrors 3 times consecutively."
                 fi
             fi
-            exec 200>&- 2>/dev/null || true
+            release_state_lock
         fi
     fi
 }
 
 handle_daemon_sync_success() {
     if [[ "$DAEMON_MODE" == true ]]; then
-        local lock_file="$CONFIG_DIR/.state.lock"
-        if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-            if flock -w 5 -x 200 2>/dev/null; then
-                rm -f "$CONFIG_DIR/sync_failures.count"
-            fi
-            exec 200>&- 2>/dev/null || true
+        if acquire_state_lock "x"; then
+            rm -f "$CONFIG_DIR/sync_failures.count"
+            release_state_lock
         fi
     fi
 }
 
-# --- 6. Main Logic ---
+# --- 7. Update Analysis & Database Query ---
 log_step "Requesting Sudo access..."
 if ! $DAEMON_MODE; then
     if ! sudo -v; then
@@ -2940,13 +3760,30 @@ if [[ -z "$updates" ]]; then
         echo ""
     fi
 
-    lock_file="$CONFIG_DIR/.state.lock"
-    if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-        if flock -w 5 -x 200 2>/dev/null; then
-            rm -f "$CONFIG_DIR/next_check.conf"
-            rm -f "$CONFIG_DIR/updates.cache"
+    if acquire_state_lock "x"; then
+        existing_ts=0
+        existing_tag=""
+        raw_existing=""
+        raw_ts=""
+        if [[ -f "$CONFIG_DIR/next_check.conf" ]]; then
+            raw_existing=$(cat "$CONFIG_DIR/next_check.conf" 2>/dev/null || echo 0)
+            raw_ts="${raw_existing%%|*}"
+            raw_ts="${raw_ts#"${raw_ts%%[![:space:]]*}"}"
+            raw_ts="${raw_ts%"${raw_ts##*[![:space:]]}"}"
+            if [[ "$raw_existing" == *"|"* ]]; then
+                existing_tag="${raw_existing#*|}"
+                existing_tag="${existing_tag#"${existing_tag%%[![:space:]]*}"}"
+                existing_tag="${existing_tag%"${existing_tag##*[![:space:]]}"}"
+            fi
+            if [[ "$raw_ts" =~ ^[0-9]+$ ]]; then
+                existing_ts=$(( 10#$raw_ts ))
+            fi
         fi
-        exec 200>&- 2>/dev/null || true
+        if [[ "$existing_tag" != "silence" ]] || (( existing_ts <= $(date +%s) )); then
+            rm -f "$CONFIG_DIR/next_check.conf"
+        fi
+        rm -f "$CONFIG_DIR/updates.cache"
+        release_state_lock
     fi
 
     sync_daemon_state >/dev/null 2>&1
@@ -3189,7 +4026,6 @@ EOF
 )
 fi
 
-# --- 7. Table Output ---
 w_age=8
 w_stat=8
 w_repo=$(( max_repo ))
@@ -3488,17 +4324,33 @@ give_advice() {
         GLOBAL_ADVISOR_SAFE=false
     fi
 
-    local lock_file="$CONFIG_DIR/.state.lock"
-    if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-        if flock -w 5 -x 200 2>/dev/null; then
-            if [[ "$GLOBAL_ADVISOR_SAFE" == "true" ]]; then
-                rm -f "$CONFIG_DIR/next_check.conf"
-            else
-                rm -f "$CONFIG_DIR/next_check.conf"
-                echo "$(( now + max_wait_sec ))" > "$CONFIG_DIR/next_check.conf"
+    if acquire_state_lock "x"; then
+        local existing_next_ts=0 existing_tag=""
+        if [[ -f "$CONFIG_DIR/next_check.conf" ]]; then
+            local raw_existing
+            raw_existing=$(cat "$CONFIG_DIR/next_check.conf" 2>/dev/null || echo 0)
+            local raw_ts="${raw_existing%%|*}"
+            raw_ts="${raw_ts#"${raw_ts%%[![:space:]]*}"}"
+            raw_ts="${raw_ts%"${raw_ts##*[![:space:]]}"}"
+            if [[ "$raw_existing" == *"|"* ]]; then
+                existing_tag="${raw_existing#*|}"
+                existing_tag="${existing_tag#"${existing_tag%%[![:space:]]*}"}"
+                existing_tag="${existing_tag%"${existing_tag##*[![:space:]]}"}"
+            fi
+            if [[ "$raw_ts" =~ ^[0-9]+$ ]]; then
+                existing_next_ts=$(( 10#$raw_ts ))
             fi
         fi
-        exec 200>&- 2>/dev/null || true
+
+        if [[ "$existing_tag" == "silence" ]] && (( existing_next_ts > now )); then
+            :
+        elif [[ "$GLOBAL_ADVISOR_SAFE" == "true" ]]; then
+            rm -f "$CONFIG_DIR/next_check.conf"
+        else
+            local target_hold=$(( now + max_wait_sec ))
+            echo "${target_hold}|advisor" > "$CONFIG_DIR/next_check.conf"
+        fi
+        release_state_lock
     fi
 
     sync_daemon_state >/dev/null 2>&1
@@ -3535,22 +4387,19 @@ if [[ "$DAEMON_MODE" == true ]]; then
     fi
 
     if [[ "$GLOBAL_ADVISOR_SAFE" == true ]] && (( pkg_count > 0 )) && command -v notify-send >/dev/null 2>&1; then
-        lock_file="$CONFIG_DIR/.state.lock"
         OLD_COUNT=0
         should_notify=false
-        if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-            if flock -w 5 -x 200 2>/dev/null; then
-                if [[ -f "$CACHE_FILE" ]]; then
-                    OLD_COUNT=$(cat "$CACHE_FILE" 2>/dev/null || echo 0)
-                fi
-                [[ ! "$OLD_COUNT" =~ ^[0-9]+$ ]] && OLD_COUNT=0
-                if [[ "${1:-}" == "--check" ]] || (( pkg_count != OLD_COUNT )); then
-                    rm -f "$CACHE_FILE"
-                    echo "$pkg_count" > "$CACHE_FILE"
-                    should_notify=true
-                fi
+        if acquire_state_lock "x"; then
+            if [[ -f "$CACHE_FILE" ]]; then
+                OLD_COUNT=$(cat "$CACHE_FILE" 2>/dev/null || echo 0)
             fi
-            exec 200>&- 2>/dev/null || true
+            [[ ! "$OLD_COUNT" =~ ^[0-9]+$ ]] && OLD_COUNT=0
+            if [[ "${1:-}" == "--check" ]] || (( pkg_count != OLD_COUNT )); then
+                rm -f "$CACHE_FILE"
+                echo "$pkg_count" > "$CACHE_FILE"
+                should_notify=true
+            fi
+            release_state_lock
         fi
 
         if [[ "$should_notify" == "true" ]]; then
@@ -3558,7 +4407,7 @@ if [[ "$DAEMON_MODE" == true ]]; then
             [[ -f "$ICON_PATH" ]] && notif_icon="$ICON_PATH"
             target_script="$(realpath "$(command -v "${BASH_SOURCE:-$0}" 2>/dev/null || echo "${BASH_SOURCE:-$0}")")"
 
-            launch_detached "$target_script" --notify-worker "$notif_icon" "$pkg_count" "$aur_count"
+            launch_detached "$target_script" --notify-worker "$notif_icon" "$pkg_count" "$aur_count" "$NOTIFICATION_TIMEOUT"
         fi
     fi
     exit 0
@@ -3948,18 +4797,15 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
 
     if $UPDATE_SUCCESS; then
         remaining_pkgs=$(check_pending_updates "all" 2>/dev/null || true)
-        lock_file="$CONFIG_DIR/.state.lock"
-        if touch "$lock_file" 2>/dev/null && exec 200<>"$lock_file" 2>/dev/null; then
-            if flock -w 5 -x 200 2>/dev/null; then
-                if [[ -n "$remaining_pkgs" ]]; then
-                    rem_count=$(grep -c . <<< "$remaining_pkgs")
-                    echo "$rem_count" > "$CONFIG_DIR/updates.cache"
-                else
-                    rm -f "$CONFIG_DIR/updates.cache"
-                fi
-                rm -f "$CONFIG_DIR/next_check.conf"
+        if acquire_state_lock "x"; then
+            if [[ -n "$remaining_pkgs" ]]; then
+                rem_count=$(grep -c . <<< "$remaining_pkgs")
+                echo "$rem_count" > "$CONFIG_DIR/updates.cache"
+            else
+                rm -f "$CONFIG_DIR/updates.cache"
             fi
-            exec 200>&- 2>/dev/null || true
+            rm -f "$CONFIG_DIR/next_check.conf"
+            release_state_lock
         fi
 
         if [[ "${ENABLE_BACKGROUND_CHECK,,}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
