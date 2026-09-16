@@ -1935,21 +1935,21 @@ for line_raw in t_lines:
                 default_el = t_ar.get(arr_name, [])
                 active_el = [x for x in el if not x.strip().startswith(chr(35))]
                 if norm_arr(el) == norm_arr(default_el):
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
                 elif active_el:
                     count_suffix = f"{len(active_el)} item{'s' if len(active_el) != 1 else ''}"
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({count_suffix}). Preserving customized list.{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GREEN}Custom user elements detected ({count_suffix}). Preserving customized list.{RESET}")
                 elif el:
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}No active elements detected (commented examples only). Preserving existing entries.{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GRAY}No active elements detected (commented examples only). Preserving existing entries.{RESET}")
                 else:
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
                 for item in el:
                     out.append(f"    {item}\n")
             else:
                 default_el = t_ar.get(arr_name, [])
                 active_default = [x for x in default_el if not x.strip().startswith(chr(35))]
                 count_info = f" ({len(active_default)} item{'s' if len(active_default) != 1 else ''})" if active_default else ""
-                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template{count_info}.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Array  {MAGENTA}{arr_name:<24}{RESET} -> {YELLOW}Adopting default list from updated template{count_info}.{RESET}")
             out.append(line_raw)
             in_arr = False
         else:
@@ -1979,17 +1979,17 @@ for line_raw in t_lines:
                 default_el = t_ar.get(arr_name, [])
                 active_el = [x for x in el if not x.strip().startswith(chr(35))]
                 if norm_arr(el) == norm_arr(default_el):
-                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
                 else:
                     out.pop()
                     out.append(f"{arr_name}=(\n")
                     if active_el:
                         count_suffix = f"{len(active_el)} item{'s' if len(active_el) != 1 else ''}"
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({count_suffix}). Preserving customized list.{RESET}")
+                        print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GREEN}Custom user elements detected ({count_suffix}). Preserving customized list.{RESET}")
                     elif el:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}No active elements detected (commented examples only). Preserving existing entries.{RESET}")
+                        print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GRAY}No active elements detected (commented examples only). Preserving existing entries.{RESET}")
                     else:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                        print(f"  {DIM}[Analyzing]{RESET} Array  {CYAN}{arr_name:<24}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
                     for item in el:
                         out.append(f"    {item}\n")
                     out.append(")\n")
@@ -1997,7 +1997,7 @@ for line_raw in t_lines:
                 default_el = t_ar.get(arr_name, [])
                 active_default = [x for x in default_el if not x.strip().startswith(chr(35))]
                 count_info = f" ({len(active_default)} item{'s' if len(active_default) != 1 else ''})" if active_default else ""
-                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template{count_info}.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Array  {MAGENTA}{arr_name:<24}{RESET} -> {YELLOW}Adopting default list from updated template{count_info}.{RESET}")
         else:
             in_arr = True
         continue
@@ -2018,11 +2018,11 @@ for line_raw in t_lines:
             user_val = u_sc[k]
             default_val = t_sc.get(k, "N/A")
             if k in prompted_keys:
-                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Setting value '{user_val}' configured via user prompt.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<24}{RESET} -> {GREEN}Setting value '{user_val}' configured via user prompt.{RESET}")
             elif user_val != default_val:
-                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<24}{RESET} -> {GREEN}Custom value '{user_val}' matches user configuration. Preserving preference.{RESET}")
             else:
-                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<23}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {CYAN}{k:<24}{RESET} -> {GRAY}Value '{user_val}' matches template. No migration needed.{RESET}")
             out.append(f"{k}={user_val}\n")
             written_scalars.add(k)
             continue
@@ -2032,7 +2032,7 @@ for line_raw in t_lines:
                 continue
             else:
                 default_val = t_sc.get(k, "N/A")
-                print(f"  {DIM}[Analyzing]{RESET} Option {MAGENTA}{k:<23}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
+                print(f"  {DIM}[Analyzing]{RESET} Option {MAGENTA}{k:<24}{RESET} -> {YELLOW}Parameter missing in user config. Appending default value: {default_val}{RESET}")
                 out.append(line_raw)
                 written_scalars.add(k)
                 continue
@@ -2045,9 +2045,9 @@ orphan_arrays = set(u_ar.keys()) - migrated_arrays
 if orphans or orphan_arrays:
     print(f"\n{YELLOW}{BOLD}:: Deprecated parameter cleanup:{RESET}")
     for o in orphans:
-        print(f"  {DIM}[Analyzing]{RESET} Option {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
+        print(f"  {DIM}[Analyzing]{RESET} Option {RED}{o:<24}{RESET} -> {GRAY}Discarding unrecognized parameter (removed from template).{RESET}")
     for o in orphan_arrays:
-        print(f"  {DIM}[Analyzing]{RESET} Array  {RED}{o:<23}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
+        print(f"  {DIM}[Analyzing]{RESET} Array  {RED}{o:<24}{RESET} -> {GRAY}Discarding unrecognized array (removed from template).{RESET}")
 
 for p_key in sorted(prompted_keys | (protected_keys & set(u_sc.keys()))):
     if p_key not in written_scalars and p_key in u_sc:
