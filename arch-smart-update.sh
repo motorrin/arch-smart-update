@@ -1841,10 +1841,10 @@ def parse(content):
                                 item = m.group(1) or m.group(2) or m.group(3)
                                 if item is not None:
                                     current_array_elems.append(item)
-                        ar[name] = current_array_elems
-                        in_array = False
-                        current_array_name = None
-                        current_array_elems = []
+                    ar[name] = current_array_elems
+                    in_array = False
+                    current_array_name = None
+                    current_array_elems = []
                 else:
                     if rest:
                         if rest.startswith(chr(35)):
@@ -1933,18 +1933,23 @@ for line_raw in t_lines:
             el = u_ar.get(arr_name)
             if el is not None:
                 default_el = t_ar.get(arr_name, [])
+                active_el = [x for x in el if not x.strip().startswith(chr(35))]
                 if norm_arr(el) == norm_arr(default_el):
                     print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
+                elif active_el:
+                    count_suffix = f"{len(active_el)} item{'s' if len(active_el) != 1 else ''}"
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({count_suffix}). Preserving customized list.{RESET}")
+                elif el:
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}No active elements detected (commented examples only). Preserving existing entries.{RESET}")
                 else:
-                    if el:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({len(el)} items). Preserving customized list.{RESET}")
-                    else:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
+                    print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
                 for item in el:
                     out.append(f"    {item}\n")
             else:
                 default_el = t_ar.get(arr_name, [])
-                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+                active_default = [x for x in default_el if not x.strip().startswith(chr(35))]
+                count_info = f" ({len(active_default)} item{'s' if len(active_default) != 1 else ''})" if active_default else ""
+                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template{count_info}.{RESET}")
             out.append(line_raw)
             in_arr = False
         else:
@@ -1971,22 +1976,28 @@ for line_raw in t_lines:
         if is_single_line:
             el = u_ar.get(arr_name)
             if el is not None:
-                out.pop()
-                out.append(f"{arr_name}=(\n")
                 default_el = t_ar.get(arr_name, [])
+                active_el = [x for x in el if not x.strip().startswith(chr(35))]
                 if norm_arr(el) == norm_arr(default_el):
                     print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Array matches template. No migration needed.{RESET}")
                 else:
-                    if el:
-                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}User elements detected ({len(el)} items). Preserving customized list.{RESET}")
+                    out.pop()
+                    out.append(f"{arr_name}=(\n")
+                    if active_el:
+                        count_suffix = f"{len(active_el)} item{'s' if len(active_el) != 1 else ''}"
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GREEN}Custom user elements detected ({count_suffix}). Preserving customized list.{RESET}")
+                    elif el:
+                        print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}No active elements detected (commented examples only). Preserving existing entries.{RESET}")
                     else:
                         print(f"  {DIM}[Analyzing]{RESET} Array {CYAN}{arr_name:<23}{RESET} -> {GRAY}Keeping array empty (user preference).{RESET}")
-                for item in el:
-                    out.append(f"    {item}\n")
-                out.append(")\n")
+                    for item in el:
+                        out.append(f"    {item}\n")
+                    out.append(")\n")
             else:
                 default_el = t_ar.get(arr_name, [])
-                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template ({len(default_el)} items).{RESET}")
+                active_default = [x for x in default_el if not x.strip().startswith(chr(35))]
+                count_info = f" ({len(active_default)} item{'s' if len(active_default) != 1 else ''})" if active_default else ""
+                print(f"  {DIM}[Analyzing]{RESET} Array {MAGENTA}{arr_name:<23}{RESET} -> {YELLOW}Adopting default list from updated template{count_info}.{RESET}")
         else:
             in_arr = True
         continue
@@ -2214,36 +2225,38 @@ if [[ ! -f "$SETTINGS_CONF" && -f "$SETTINGS_DEFAULT" ]]; then
 
     if [[ "$daemon_ans" =~ ^[Yy]$ ]]; then
         if write_bg_check_setting "$SETTINGS_CONF" "true"; then
-            echo -e "${dim}Background checker enabled.${reset}\n"
+            echo -e "${dim}Background checker enabled.${reset}"
             if ! pacman -Q libnotify >/dev/null 2>&1; then
-                echo -e "${yellow}Warning: The ${red}libnotify${yellow} package is not installed. Please install it for notifications to work.${reset}\n"
+                echo -e "${yellow}Warning: The ${red}libnotify${yellow} package is not installed. Please install it for notifications to work.${reset}"
             fi
         else
-            echo -e "${red}Warning: Failed to update background checker setting in configuration file.${reset}\n"
+            echo -e "${red}Warning: Failed to update background checker setting in configuration file.${reset}"
         fi
     else
         if write_bg_check_setting "$SETTINGS_CONF" "false"; then
-            echo -e "${dim}Background checker disabled.${reset}\n"
+            echo -e "${dim}Background checker disabled.${reset}"
         else
-            echo -e "${red}Warning: Failed to update background checker setting in configuration file.${reset}\n"
+            echo -e "${red}Warning: Failed to update background checker setting in configuration file.${reset}"
         fi
     fi
 
     if [[ "$clean_ans" =~ ^[Yy]$ ]]; then
         sed -i 's/^ENABLE_POST_CLEANUP=.*/ENABLE_POST_CLEANUP=true/' "$SETTINGS_CONF"
-        echo -e "${dim}Post-update cleanup enabled.${reset}\n"
+        echo -e "${dim}Post-update cleanup enabled.${reset}"
     else
         sed -i 's/^ENABLE_POST_CLEANUP=.*/ENABLE_POST_CLEANUP=false/' "$SETTINGS_CONF"
-        echo -e "${dim}Post-update cleanup disabled.${reset}\n"
+        echo -e "${dim}Post-update cleanup disabled.${reset}"
     fi
 
     if [[ "$log_ans" =~ ^[Yy]$ ]]; then
         sed -i 's/^GENERATE_LOGS=.*/GENERATE_LOGS=true/' "$SETTINGS_CONF"
-        echo -e "${dim}Log generation enabled.${reset}\n"
+        echo -e "${dim}Log generation enabled.${reset}"
     else
         sed -i 's/^GENERATE_LOGS=.*/GENERATE_LOGS=false/' "$SETTINGS_CONF"
-        echo -e "${dim}Log generation disabled.${reset}\n"
+        echo -e "${dim}Log generation disabled.${reset}"
     fi
+
+    echo ""
 
     chmod 600 "$SETTINGS_CONF" 2>/dev/null || true
 fi
