@@ -2,6 +2,7 @@
 
 # --- 1. Initialization & Environment Setup ---
 set -uo pipefail
+export TOPGRADE_NO_SELF_UPGRADE=1
 
 if [ -t 1 ]; then
     reset='\033[0m'
@@ -357,13 +358,20 @@ launch_detached() {
     local runner=()
     [[ "${1:-}" == *.sh ]] && runner=(/bin/bash)
 
+    local launched=false
     if [[ -d /run/systemd/system ]] && command -v systemd-run >/dev/null 2>&1; then
-        systemd-run --user --quiet --collect -- "${env_wrapper[@]}" ${runner[@]+"${runner[@]}"} "$@" >/dev/null 2>&1
-    elif command -v setsid >/dev/null 2>&1; then
-        "${env_wrapper[@]}" setsid -f ${runner[@]+"${runner[@]}"} "$@" </dev/null >/dev/null 2>&1
-    else
-        "${env_wrapper[@]}" nohup ${runner[@]+"${runner[@]}"} "$@" </dev/null >/dev/null 2>&1 &
-        disown 2>/dev/null || true
+        if systemd-run --user --quiet --collect -p KillMode=process -- "${env_wrapper[@]}" ${runner[@]+"${runner[@]}"} "$@" >/dev/null 2>&1; then
+            launched=true
+        fi
+    fi
+
+    if [[ "$launched" == "false" ]]; then
+        if command -v setsid >/dev/null 2>&1; then
+            "${env_wrapper[@]}" setsid -f ${runner[@]+"${runner[@]}"} "$@" </dev/null >/dev/null 2>&1
+        else
+            "${env_wrapper[@]}" nohup ${runner[@]+"${runner[@]}"} "$@" </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+        fi
     fi
 }
 
@@ -405,24 +413,50 @@ handle_news_worker() {
         echo "${news_ts}|silenced" > "$news_cache"
         open_url() {
             local url="$1"
+
+            if command -v gdbus >/dev/null 2>&1; then
+                if gdbus call --session \
+                    --dest org.freedesktop.portal.Desktop \
+                    --object-path /org/freedesktop/portal/desktop \
+                    --method org.freedesktop.portal.OpenURI.OpenURI \
+                    --timeout 5 \
+                    "" "$url" "@a{sv} {}" >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+
             local default_browser=""
-            if command -v xdg-settings >/dev/null 2>&1; then
+            if [[ -n "${BROWSER:-}" ]] && command -v "$BROWSER" >/dev/null 2>&1; then
+                default_browser="$BROWSER"
+            elif command -v xdg-settings >/dev/null 2>&1; then
                 default_browser=$(xdg-settings get default-web-browser 2>/dev/null)
                 default_browser="${default_browser%.desktop}"
             fi
+
             if [[ -n "$default_browser" ]] && command -v "$default_browser" >/dev/null 2>&1; then
-                exec "$default_browser" "$url"
+                launch_detached "$default_browser" "$url"
+                return 0
             fi
+
+            if command -v gio >/dev/null 2>&1; then
+                launch_detached gio open "$url"
+                return 0
+            fi
+
             if command -v xdg-open >/dev/null 2>&1; then
-                exec xdg-open "$url"
+                launch_detached xdg-open "$url"
+                return 0
             fi
-            for browser in "firefox" "chromium" "google-chrome-stable" "librewolf" "brave" "waterfox" "opera" "epiphany" "falkon"; do
+
+            for browser in "firefox" "chromium" "google-chrome-stable" "librewolf" "brave" "zen-browser" "waterfox" "opera" "epiphany" "falkon"; do
                 if command -v "$browser" >/dev/null 2>&1; then
-                    exec "$browser" "$url"
+                    launch_detached "$browser" "$url"
+                    return 0
                 fi
             done
         }
         open_url "https://archlinux.org/"
+        sleep 0.5
     fi
 }
 
@@ -4480,10 +4514,14 @@ elif [[ ${#CUSTOM_CMDS[@]} -gt 0 ]]; then
         PROMPT_CMD="Custom config (${#CUSTOM_CMDS[@]} commands)"
     fi
 elif [[ -n "$BEST_UPDATE_TOOL" && "$HAS_TOPGRADE" == "true" ]]; then
-    PROMPT_CMD="$BEST_UPDATE_TOOL && topgrade"
+    if [[ -n "$AUR_HELPER" && "$aur_count" -gt 0 ]]; then
+        PROMPT_CMD="$BEST_UPDATE_TOOL (+ $HELPER_BIN) && topgrade --disable system"
+    else
+        PROMPT_CMD="$BEST_UPDATE_TOOL && topgrade --disable system"
+    fi
 elif [[ -n "$BEST_UPDATE_TOOL" ]]; then
     PROMPT_CMD="$BEST_UPDATE_TOOL"
-    [[ -n "$AUR_HELPER" ]] && PROMPT_CMD="$PROMPT_CMD (fallback: $HELPER_BIN)"
+    [[ -n "$AUR_HELPER" && "$aur_count" -gt 0 ]] && PROMPT_CMD="$PROMPT_CMD (fallback: $HELPER_BIN)"
 elif [[ "$HAS_TOPGRADE" == "true" ]]; then
     PROMPT_CMD="topgrade"
 else
@@ -4515,6 +4553,8 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
     backup_pacman_db
     UPDATE_SUCCESS=false
     RUN_STANDARD=true
+    core_exit=0
+    topgrade_exit=0
 
     if [[ ${#CUSTOM_CMDS[@]} -gt 0 ]]; then
         RUN_STANDARD=false
@@ -4637,38 +4677,109 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                     fi
                 fi
 
-                pending_updates=$(check_pending_updates "repo_only")
+                repo_phase_ok=false
+                should_run_topgrade=false
+                topgrade_disable_args="--disable system"
 
-                if [[ $core_exit -eq 0 && -z "$pending_updates" ]]; then
-                    echo -e "\n${green}Core updates applied successfully.${reset}"
-                    echo -e "\n${blue}${bold}Running Topgrade (Firmware, Flatpaks, Dotfiles)...${reset}\n"
-                    execute_update_task "topgrade"
-                    topgrade_exit=$?
-                    UPDATE_SUCCESS=true
-                    if [[ $topgrade_exit -ne 0 ]]; then
-                        echo -e "\n${yellow}Warning: Topgrade finished with exit code $topgrade_exit (some secondary updates may have been skipped).${reset}"
+                if [[ $core_exit -eq 0 ]]; then
+                    pending_repo=$(check_pending_updates "repo_only")
+
+                    if [[ -z "$pending_repo" ]]; then
+                        repo_phase_ok=true
+                        pending_all=$(check_pending_updates "all")
+
+                        if [[ -z "$pending_all" ]]; then
+                            should_run_topgrade=true
+                            UPDATE_SUCCESS=true
+                            echo -e "\n${green}Core updates applied successfully.${reset}"
+                        else
+                            echo -e "\n${green}Official repository packages updated successfully via $tool_name.${reset}"
+
+                            if [[ -z "$AUR_HELPER" ]]; then
+                                UPDATE_SUCCESS=true
+                                should_run_topgrade=true
+                                echo -e "\n${yellow}Note: AUR packages were skipped because no AUR helper (e.g. yay/paru) is installed.${reset}"
+                            else
+                                aur_flags="-Syu"
+                                if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku)$ ]]; then
+                                    aur_flags="-Sua"
+                                elif [[ "$HELPER_BIN" == "aura" ]]; then
+                                    aur_flags="-Aua"
+                                elif [[ "$HELPER_BIN" == "rua" ]]; then
+                                    aur_flags="upgrade"
+                                fi
+
+                                echo -ne "${white}Run $HELPER_BIN to apply remaining updates? [Y/n]: ${reset}"
+                                force_aur=""
+                                read -r force_aur </dev/tty 2>/dev/null || read -r force_aur 2>/dev/null || force_aur="n"
+                                if [[ "$force_aur" =~ ^[Yy]$ || -z "$force_aur" ]]; then
+                                    execute_update_task "$AUR_HELPER $aur_flags"
+                                    aur_task_exit=$?
+
+                                    if [[ $aur_task_exit -eq 130 || $aur_task_exit -eq 143 || $aur_task_exit -eq 2 ]]; then
+                                        UPDATE_SUCCESS=false
+                                        should_run_topgrade=false
+                                        echo -e "\n${yellow}Warning: AUR update was cancelled by user.${reset}"
+                                    elif [[ $aur_task_exit -eq 0 && -z "$(check_pending_updates)" ]]; then
+                                        UPDATE_SUCCESS=true
+                                        should_run_topgrade=true
+                                        echo -e "\n${green}AUR packages updated successfully.${reset}"
+                                    else
+                                        UPDATE_SUCCESS=false
+                                        echo -e "\n${red}Some AUR updates are still pending or failed.${reset}"
+                                        echo -ne "${white}Run topgrade anyway? (Firmware, Flatpaks, Dotfiles) [y/N]: ${reset}"
+                                        force_extra_aur="n"
+                                        read -r force_extra_aur </dev/tty 2>/dev/null || read -r force_extra_aur 2>/dev/null || force_extra_aur="n"
+                                        if [[ "$force_extra_aur" =~ ^[Yy]$ ]]; then
+                                            should_run_topgrade=true
+                                        else
+                                            should_run_topgrade=false
+                                            echo -e "${dim}Skipping extra updates.${reset}\n"
+                                        fi
+                                    fi
+                                else
+                                    UPDATE_SUCCESS=true
+                                    should_run_topgrade=true
+                                    echo -e "\n${yellow}Official repository packages updated successfully. AUR updates skipped by user.${reset}"
+                                fi
+                            fi
+                        fi
                     fi
-                    if [[ -z "$AUR_HELPER" && -n "$(check_pending_updates)" ]]; then
-                        echo -e "\n${yellow}Note: AUR packages were skipped because no AUR helper (e.g. yay/paru) is installed.${reset}"
+                fi
+
+                if [[ "$repo_phase_ok" == "true" ]]; then
+                    if [[ "$should_run_topgrade" == "true" ]]; then
+                        echo -e "\n${blue}${bold}Running Topgrade (Firmware, Flatpaks, Dotfiles)...${reset}\n"
+                        execute_update_task "topgrade $topgrade_disable_args"
+                        topgrade_exit=$?
+
+                        if [[ $topgrade_exit -eq 130 || $topgrade_exit -eq 143 || $topgrade_exit -eq 2 ]]; then
+                            UPDATE_SUCCESS=false
+                            echo -e "\n${yellow}Warning: Topgrade was cancelled by user (secondary updates interrupted).${reset}"
+                        elif [[ $topgrade_exit -ne 0 ]]; then
+                            echo -e "\n${yellow}Warning: Topgrade finished with exit code $topgrade_exit (some secondary updates may have been skipped).${reset}"
+                        fi
                     fi
                 else
-                    echo -e "\n${yellow}$tool_name was cancelled or did not fully apply updates.${reset}"
-                    echo -ne "${white}Run topgrade anyway? (Flatpaks/AUR etc) [y/N]: ${reset}"
-                    read -r force_extra
+                    if [[ $core_exit -eq 130 || $core_exit -eq 143 || $core_exit -eq 2 ]]; then
+                        echo -e "\n${yellow}Core repository updates were cancelled by user ($tool_name).${reset}"
+                    elif [[ $core_exit -ne 0 ]]; then
+                        echo -e "\n${red}Core repository updates were not fully applied by $tool_name (exit code: $core_exit).${reset}"
+                    else
+                        echo -e "\n${red}Repository updates remain unapplied after running $tool_name.${reset}"
+                    fi
+                    echo -ne "${white}Run topgrade anyway? (Firmware, Flatpaks, Dotfiles) [y/N]: ${reset}"
+                    force_extra="n"
+                    read -r force_extra </dev/tty 2>/dev/null || read -r force_extra 2>/dev/null || force_extra="n"
                     if [[ "$force_extra" =~ ^[Yy]$ ]]; then
-                        execute_update_task "topgrade"
+                        execute_update_task "topgrade $topgrade_disable_args"
                         topgrade_exit=$?
-                        pending_repo_after=$(check_pending_updates "repo_only")
-                        if [[ -z "$pending_repo_after" ]]; then
-                            UPDATE_SUCCESS=true
-                            if [[ $topgrade_exit -ne 0 ]]; then
-                                echo -e "\n${yellow}Warning: Topgrade exited with code $topgrade_exit, but repository updates were successfully applied.${reset}"
-                            fi
-                            if [[ -z "$AUR_HELPER" && -n "$(check_pending_updates)" ]]; then
-                                echo -e "\n${yellow}Note: AUR packages were skipped because no AUR helper (e.g. yay/paru) is installed.${reset}"
-                            fi
+                        if [[ $topgrade_exit -eq 130 || $topgrade_exit -eq 143 || $topgrade_exit -eq 2 ]]; then
+                            UPDATE_SUCCESS=false
+                            echo -e "\n${yellow}Warning: Topgrade was cancelled by user.${reset}"
                         else
-                            echo -e "\n${red}Topgrade finished with exit code $topgrade_exit, and repository updates remain unapplied.${reset}"
+                            UPDATE_SUCCESS=false
+                            echo -e "\n${red}Secondary updates completed, but repository updates remain unapplied.${reset}"
                         fi
                     else
                         echo -e "${dim}Skipping extra updates.${reset}\n"
@@ -4692,49 +4803,57 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                     fi
                 fi
 
-                pending_updates=$(check_pending_updates)
-                pending_repo=$(check_pending_updates "repo_only")
+                if [[ $core_exit -eq 0 ]]; then
+                    pending_repo=$(check_pending_updates "repo_only")
 
-                if [[ $core_exit -eq 0 && -z "$pending_updates" ]]; then
-                    UPDATE_SUCCESS=true
-                elif [[ $core_exit -eq 0 && -z "$pending_repo" ]]; then
-                    if [[ -z "$AUR_HELPER" ]]; then
-                        UPDATE_SUCCESS=true
-                        echo -e "\n${yellow}Official repository packages updated successfully via $tool_name.${reset}"
-                        echo -e "${yellow}Note: AUR packages were skipped because no AUR helper (e.g. yay/paru) is installed.${reset}"
-                    else
-                        aur_flags="-Syu"
-                        if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku)$ ]]; then
-                            aur_flags="-Sua"
-                        elif [[ "$HELPER_BIN" == "aura" ]]; then
-                            aur_flags="-Aua"
-                        elif [[ "$HELPER_BIN" == "rua" ]]; then
-                            aur_flags="upgrade"
-                        fi
+                    if [[ -z "$pending_repo" ]]; then
+                        pending_all=$(check_pending_updates "all")
 
-                        echo -ne "${white}Run $HELPER_BIN to apply remaining updates? [Y/n]: ${reset}"
-                        if read -r force_aur; then
-                            if [[ "$force_aur" =~ ^[Yy]$ || -z "$force_aur" ]]; then
-                                execute_update_task "$AUR_HELPER $aur_flags"
-                                aur_task_exit=$?
-
-                                if [[ $aur_task_exit -eq 0 && -z "$(check_pending_updates)" ]]; then
-                                    UPDATE_SUCCESS=true
-                                else
-                                    echo -e "\n${red}Some updates are still pending or failed.${reset}"
-                                fi
-                            else
+                        if [[ -z "$pending_all" ]]; then
+                            UPDATE_SUCCESS=true
+                        else
+                            if [[ -z "$AUR_HELPER" ]]; then
                                 UPDATE_SUCCESS=true
-                                echo -e "\n${yellow}Official repository packages updated successfully. AUR updates skipped by user.${reset}"
+                                echo -e "\n${yellow}Official repository packages updated successfully via $tool_name.${reset}"
+                                echo -e "${yellow}Note: AUR packages were skipped because no AUR helper (e.g. yay/paru) is installed.${reset}"
+                            else
+                                aur_flags="-Syu"
+                                if [[ "$HELPER_BIN" =~ ^(yay|paru|pikaur|trizen|pacaur|pakku)$ ]]; then
+                                    aur_flags="-Sua"
+                                elif [[ "$HELPER_BIN" == "aura" ]]; then
+                                    aur_flags="-Aua"
+                                elif [[ "$HELPER_BIN" == "rua" ]]; then
+                                    aur_flags="upgrade"
+                                fi
+
+                                echo -ne "${white}Run $HELPER_BIN to apply remaining updates? [Y/n]: ${reset}"
+                                force_aur=""
+                                read -r force_aur </dev/tty 2>/dev/null || read -r force_aur 2>/dev/null || force_aur="n"
+                                if [[ "$force_aur" =~ ^[Yy]$ || -z "$force_aur" ]]; then
+                                    execute_update_task "$AUR_HELPER $aur_flags"
+                                    aur_task_exit=$?
+
+                                    if [[ $aur_task_exit -eq 130 || $aur_task_exit -eq 143 || $aur_task_exit -eq 2 ]]; then
+                                        UPDATE_SUCCESS=false
+                                        echo -e "\n${yellow}Warning: AUR update was cancelled by user.${reset}"
+                                    elif [[ $aur_task_exit -eq 0 && -z "$(check_pending_updates)" ]]; then
+                                        UPDATE_SUCCESS=true
+                                        echo -e "\n${green}AUR packages updated successfully.${reset}"
+                                    else
+                                        UPDATE_SUCCESS=false
+                                        echo -e "\n${red}Some updates are still pending or failed.${reset}"
+                                    fi
+                                else
+                                    UPDATE_SUCCESS=true
+                                    echo -e "\n${yellow}Official repository packages updated successfully. AUR updates skipped by user.${reset}"
+                                fi
                             fi
                         fi
-                    fi
-                else
-                    if [[ $core_exit -ne 0 ]]; then
-                        echo -e "\n${red}Core repository updates were not fully applied by $tool_name (exit code: $core_exit).${reset}"
-                    elif [[ -n "$pending_repo" ]]; then
+                    else
                         echo -e "\n${red}Repository updates remain unapplied after running $tool_name.${reset}"
                     fi
+                else
+                    echo -e "\n${red}Core repository updates were not fully applied by $tool_name (exit code: $core_exit).${reset}"
                 fi
 
             elif [[ "$HAS_TOPGRADE" == "true" ]]; then
@@ -4892,7 +5011,44 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         check_aur_rebuild_needed
         check_reboot_needed
     else
+        remaining_pkgs=$(check_pending_updates "all" 2>/dev/null || true)
+        if acquire_state_lock "x"; then
+            if [[ -n "$remaining_pkgs" ]]; then
+                rem_count=$(grep -c . <<< "$remaining_pkgs")
+                echo "$rem_count" > "$CONFIG_DIR/updates.cache"
+            else
+                rm -f "$CONFIG_DIR/updates.cache"
+            fi
+            fail_raw_next=""
+            fail_next_ts=0
+            fail_existing_tag=""
+            fail_now_ts=0
+            if [[ -f "$CONFIG_DIR/next_check.conf" ]]; then
+                fail_raw_next=$(cat "$CONFIG_DIR/next_check.conf" 2>/dev/null || echo 0)
+                fail_next_ts="${fail_raw_next%%|*}"
+                fail_next_ts="${fail_next_ts#"${fail_next_ts%%[![:space:]]*}"}"
+                fail_next_ts="${fail_next_ts%"${fail_next_ts##*[![:space:]]}"}"
+                if [[ "$fail_raw_next" == *"|"* ]]; then
+                    fail_existing_tag="${fail_raw_next#*|}"
+                    fail_existing_tag="${fail_existing_tag#"${fail_existing_tag%%[![:space:]]*}"}"
+                    fail_existing_tag="${fail_existing_tag%"${fail_existing_tag##*[![:space:]]}"}"
+                fi
+                fail_now_ts=$(date +%s)
+                if [[ "$fail_existing_tag" != "silence" && "$fail_existing_tag" != "advisor" ]]; then
+                    rm -f "$CONFIG_DIR/next_check.conf"
+                elif [[ "$fail_next_ts" =~ ^[0-9]+$ ]] && (( fail_next_ts <= fail_now_ts )); then
+                    rm -f "$CONFIG_DIR/next_check.conf"
+                fi
+            fi
+            release_state_lock
+        fi
+
+        if [[ "${ENABLE_BACKGROUND_CHECK,,}" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+            sync_daemon_state >/dev/null 2>&1
+        fi
+
         echo -e "\n${red}Update process completed with errors, partial updates, or was cancelled.${reset}\n"
+        check_reboot_needed
     fi
 
 else
