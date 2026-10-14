@@ -146,7 +146,7 @@ acquire_state_lock() {
         fi
     fi
     local fd=""
-    if exec {fd}<>"$lock_file" 2>/dev/null; then
+    if { exec {fd}<>"$lock_file"; } 2>/dev/null; then
         if [[ "$lock_mode" == "s" ]]; then
             if flock -w 5 -s "$fd" 2>/dev/null; then
                 ASU_STATE_LOCK_FD="$fd"
@@ -162,7 +162,7 @@ acquire_state_lock() {
                 return 0
             fi
         fi
-        exec {fd}>&- 2>/dev/null || true
+        { exec {fd}>&-; } 2>/dev/null || true
     fi
     return 1
 }
@@ -176,7 +176,7 @@ release_state_lock() {
     fi
     if (( ASU_STATE_LOCK_DEPTH == 0 )) && [[ -n "$ASU_STATE_LOCK_FD" ]]; then
         if [[ "$ASU_STATE_LOCK_FD" =~ ^[0-9]+$ ]]; then
-            exec {ASU_STATE_LOCK_FD}>&- 2>/dev/null || true
+            { exec {ASU_STATE_LOCK_FD}>&-; } 2>/dev/null || true
         fi
         ASU_STATE_LOCK_FD=""
         ASU_STATE_LOCK_MODE=""
@@ -1703,6 +1703,7 @@ handle_silence() {
 handle_reconfigure() {
     local real_settings_conf orig_bg_val="" bg_val_found=false
     local pre_reconf_cmds_hash="" reconf_was_trusted=false
+    local local_trust_file="$CONFIG_DIR/.trusted_hash"
 
     real_settings_conf=$(realpath -m "$SETTINGS_CONF" 2>/dev/null || realpath "$SETTINGS_CONF" 2>/dev/null || echo "$SETTINGS_CONF")
 
@@ -2796,7 +2797,7 @@ EOF
         diff_hours=$(( (now_time - news_ts) / 3600 ))
         (( diff_hours < 0 )) && diff_hours=0
 
-        if (( diff_hours < 9999 )); then
+        if (( diff_hours < 336 )); then
             local NEWS_CACHE="$CONFIG_DIR/news.cache"
             local OLD_NEWS_TS=0
             local NEWS_SILENCED=false
@@ -4081,6 +4082,7 @@ while read -r pkgname old_ver _ new_ver _rest; do
 
         if [[ -n "$epoch_new" ]] && (( epoch_new > 0 )); then
             diff_hours=$(( (now - epoch_new) / 3600 ))
+            (( diff_hours < 0 )) && diff_hours=0
         fi
     fi
 
@@ -4197,7 +4199,7 @@ printf "${dim}%s${reset}\n" "$sep_line"
 
 env LC_ALL=C sort -n "$OUTPUT_FILE" | while IFS=$'\t' read -r key diff_hours pkg_level upd_type pkgname old_ver new_ver repo size is_explicit epoch_new fmt_date_new desc; do
 
-    if (( diff_hours == 336 )); then age_disp="[?]"; age_col=$dim
+    if [[ "${epoch_new:-0}" == "0" ]]; then age_disp="[?]"; age_col=$dim
     else
         age_disp="[${diff_hours}h]"
         if (( diff_hours < 12 )); then age_col="${red}${bold}"
@@ -4682,6 +4684,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
     fi
 
     if $RUN_STANDARD; then
+        UPDATE_SUCCESS=false
         PGP_SIG_ERROR_REGEX='(\[GNUPG:\]|\b(BADSIG|ERRSIG|EXPKEYSIG|REVKEYSIG|NO_PUBKEY|KEYEXPIRED|SIGEXPIRED|KEYREVOKED|NODATA|TRUST_UNDEFINED)\b|\bGPGME(\s+error|_ERR_)|\([^)]*\b(PGP|GPG)\b[^)]*\)|\b(trustdb\.gpg|pubring\.(gpg|kbx)|pacman-key)\b)'
 
         if [[ "${IS_OFFLINE_MODE:-false}" == "true" ]]; then
