@@ -335,16 +335,22 @@ launch_detached() {
     local dbus_addr="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$run_dir/bus}"
 
     local env_wrapper=(env)
+    local env_unsets=()
+    local env_vars=()
+
     if [[ -n "${DETECTED_WAYLAND:-}" ]]; then
-        env_wrapper+=("WAYLAND_DISPLAY=$DETECTED_WAYLAND")
+        env_vars+=("WAYLAND_DISPLAY=$DETECTED_WAYLAND")
     else
-        env_wrapper+=("-u" "WAYLAND_DISPLAY")
+        env_unsets+=("-u" "WAYLAND_DISPLAY")
     fi
     if [[ -n "${DETECTED_DISPLAY:-}" ]]; then
-        env_wrapper+=("DISPLAY=$DETECTED_DISPLAY")
+        env_vars+=("DISPLAY=$DETECTED_DISPLAY")
     else
-        env_wrapper+=("-u" "DISPLAY")
+        env_unsets+=("-u" "DISPLAY")
     fi
+
+    [[ ${#env_unsets[@]} -gt 0 ]] && env_wrapper+=("${env_unsets[@]}")
+    [[ ${#env_vars[@]} -gt 0 ]] && env_wrapper+=("${env_vars[@]}")
     [[ -n "${run_dir:-}" ]] && env_wrapper+=("XDG_RUNTIME_DIR=$run_dir")
     [[ -n "${dbus_addr:-}" ]] && env_wrapper+=("DBUS_SESSION_BUS_ADDRESS=$dbus_addr")
     [[ -n "${PATH:-}" ]] && env_wrapper+=("PATH=$PATH")
@@ -373,6 +379,35 @@ launch_detached() {
             disown 2>/dev/null || true
         fi
     fi
+}
+
+resolve_desktop_exec() {
+    local desktop_id="${1:-}"
+    local url="${2:-}"
+    local dir="" file="" exec_line="" tok="" has_url=false
+    local -a search_dirs=() tokens=() out=()
+    [[ -z "$desktop_id" ]] && return 1
+    IFS=':' read -ra search_dirs <<< "${XDG_DATA_HOME:-$USER_HOME/.local/share}:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}:$USER_HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/var/lib/snapd/desktop"
+    for dir in "${search_dirs[@]}"; do
+        file="$dir/applications/$desktop_id"
+        [[ -f "$file" ]] || continue
+        exec_line=$(awk '/^\[Desktop Entry\]/ {e=1; next} /^\[/ {e=0} e && /^Exec=/ && x == "" {sub(/^Exec=/, ""); x=$0} e && /^Terminal=true/ {t=1} END {if (x != "" && !t) print x}' "$file" 2>/dev/null)
+        [[ -z "$exec_line" ]] && continue
+        read -ra tokens <<< "$exec_line"
+        out=()
+        has_url=false
+        for tok in "${tokens[@]}"; do
+            case "$tok" in
+                %u|%U|%f|%F) out+=("$url"); has_url=true ;;
+                %*) ;;
+                *) out+=("$tok") ;;
+            esac
+        done
+        [[ "$has_url" == "false" ]] && out+=("$url")
+        printf '%s\n' "${out[@]}"
+        return 0
+    done
+    return 1
 }
 
 handle_news_worker() {
@@ -413,30 +448,40 @@ handle_news_worker() {
         echo "${news_ts}|silenced" > "$news_cache"
         open_url() {
             local url="$1"
+            local desktop_id="" default_browser="" browser=""
+            local -a exec_cmd=()
 
-            if command -v gdbus >/dev/null 2>&1; then
-                if gdbus call --session \
-                    --dest org.freedesktop.portal.Desktop \
-                    --object-path /org/freedesktop/portal/desktop \
-                    --method org.freedesktop.portal.OpenURI.OpenURI \
-                    --timeout 5 \
-                    "" "$url" "@a{sv} {}" >/dev/null 2>&1; then
+            if [[ -n "${BROWSER:-}" ]] && command -v "$BROWSER" >/dev/null 2>&1; then
+                launch_detached "$BROWSER" "$url"
+                return 0
+            fi
+
+            if command -v xdg-settings >/dev/null 2>&1; then
+                desktop_id=$(xdg-settings get default-web-browser 2>/dev/null | head -n 1)
+            fi
+            if [[ -z "$desktop_id" ]] && command -v xdg-mime >/dev/null 2>&1; then
+                desktop_id=$(xdg-mime query default x-scheme-handler/https 2>/dev/null | head -n 1)
+            fi
+
+            if [[ -n "$desktop_id" ]]; then
+                mapfile -t exec_cmd < <(resolve_desktop_exec "$desktop_id" "$url")
+                if (( ${#exec_cmd[@]} > 0 )) && command -v "${exec_cmd[0]}" >/dev/null 2>&1; then
+                    launch_detached "${exec_cmd[@]}"
+                    return 0
+                fi
+                default_browser="${desktop_id%.desktop}"
+                if command -v "$default_browser" >/dev/null 2>&1; then
+                    launch_detached "$default_browser" "$url"
                     return 0
                 fi
             fi
 
-            local default_browser=""
-            if [[ -n "${BROWSER:-}" ]] && command -v "$BROWSER" >/dev/null 2>&1; then
-                default_browser="$BROWSER"
-            elif command -v xdg-settings >/dev/null 2>&1; then
-                default_browser=$(xdg-settings get default-web-browser 2>/dev/null)
-                default_browser="${default_browser%.desktop}"
-            fi
-
-            if [[ -n "$default_browser" ]] && command -v "$default_browser" >/dev/null 2>&1; then
-                launch_detached "$default_browser" "$url"
-                return 0
-            fi
+            for browser in "zen-browser" "zen" "firefox" "chromium" "google-chrome-stable" "google-chrome" "librewolf" "brave" "waterfox" "opera" "epiphany" "falkon"; do
+                if command -v "$browser" >/dev/null 2>&1; then
+                    launch_detached "$browser" "$url"
+                    return 0
+                fi
+            done
 
             if command -v gio >/dev/null 2>&1; then
                 launch_detached gio open "$url"
@@ -447,13 +492,6 @@ handle_news_worker() {
                 launch_detached xdg-open "$url"
                 return 0
             fi
-
-            for browser in "firefox" "chromium" "google-chrome-stable" "librewolf" "brave" "zen-browser" "waterfox" "opera" "epiphany" "falkon"; do
-                if command -v "$browser" >/dev/null 2>&1; then
-                    launch_detached "$browser" "$url"
-                    return 0
-                fi
-            done
         }
         open_url "https://archlinux.org/"
         sleep 0.5
@@ -634,7 +672,29 @@ cleanup() {
     done
 }
 
-trap cleanup EXIT INT TERM
+# shellcheck disable=SC2329
+handle_sigint() {
+    trap "" INT TERM
+    trap - EXIT
+    cleanup
+    trap - INT TERM
+    kill -s INT $$ 2>/dev/null || exit 130
+    exit 130
+}
+
+# shellcheck disable=SC2329
+handle_sigterm() {
+    trap "" INT TERM
+    trap - EXIT
+    cleanup
+    trap - INT TERM
+    kill -s TERM $$ 2>/dev/null || exit 143
+    exit 143
+}
+
+trap cleanup EXIT
+trap handle_sigint INT
+trap handle_sigterm TERM
 
 log_step() {
     echo -e "${dim}[$(date +%T)] ${1:-}${reset}"
@@ -698,7 +758,7 @@ update_from_github() {
     target_url=$(bypass_cdn_cache "$url")
 
     if curl -sLfo "$tmp_file" --connect-timeout "$conn_timeout" --max-time "$max_time" "$target_url"; then
-        if [[ -n "$expected_string" ]] && ! grep -q "$expected_string" "$tmp_file"; then
+        if [[ -n "$expected_string" ]] && ! grep -qF -- "$expected_string" "$tmp_file"; then
             rm -f "$tmp_file"
             [[ ! -f "$file_path" ]] && echo -e "${red}Failed to download $filename (Invalid format / Captive Portal)${reset}"
             return 1
@@ -2180,11 +2240,13 @@ EOF
 
 # --- 3. CLI Action Dispatch ---
 if [[ "${1:-}" == "--notify-worker" ]]; then
+    trap - INT TERM
     handle_notify_worker "$@"
     exit 0
 fi
 
 if [[ "${1:-}" == "--news-worker" ]]; then
+    trap - INT TERM
     handle_news_worker "$@"
     exit 0
 fi
@@ -2734,7 +2796,7 @@ EOF
         diff_hours=$(( (now_time - news_ts) / 3600 ))
         (( diff_hours < 0 )) && diff_hours=0
 
-        if (( diff_hours < 336 )); then
+        if (( diff_hours < 9999 )); then
             local NEWS_CACHE="$CONFIG_DIR/news.cache"
             local OLD_NEWS_TS=0
             local NEWS_SILENCED=false
@@ -2861,6 +2923,8 @@ execute_update_task() {
         wrapper="sudo -v && $cmd"
     fi
 
+    trap ':' INT
+
     local executed_with_script=false
     if $has_custom_tty && [ -t "$ASU_TTY_OUT" ] && [ -t 0 ] && command -v script >/dev/null 2>&1; then
         if env SHELL=/bin/bash script -f -q -e -c "true" /dev/null >/dev/null 2>&1; then
@@ -2905,6 +2969,8 @@ EOF
             ret=${PIPESTATUS[0]}
         fi
     fi
+
+    trap handle_sigint INT
 
     if [ -f "$task_capture" ]; then
         LAST_TASK_OUTPUT=$(tail -n 300 "$task_capture" 2>/dev/null | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\x1B\([B0]//g' || true)
@@ -3074,10 +3140,12 @@ check_disk_space() {
     local boot_candidates=("/boot" "/efi" "/boot/efi")
     local checked_mount_devices=()
     for boot_target in "${boot_candidates[@]}"; do
-        if mountpoint -q "$boot_target" 2>/dev/null || sudo -n mountpoint -q "$boot_target" 2>/dev/null; then
+        if mountpoint -q "$boot_target" 2>/dev/null || findmnt -M "$boot_target" >/dev/null 2>&1; then
             local dev_id
             dev_id=$(stat -Lc '%d' "$boot_target" 2>/dev/null || true)
-            [[ -z "$dev_id" ]] && dev_id=$(sudo -n stat -Lc '%d' "$boot_target" 2>/dev/null || true)
+            if [[ -z "$dev_id" ]]; then
+                dev_id=$(findmnt -n -o MAJ:MIN -M "$boot_target" 2>/dev/null | head -n 1 | tr -d '[:space:]' || true)
+            fi
 
             if [[ -n "$dev_id" ]]; then
                 local already_checked=false
@@ -3092,7 +3160,7 @@ check_disk_space() {
             fi
 
             boot_free_kb=$(env LC_ALL=C df -Pk "$boot_target" 2>/dev/null | awk 'NR==2 {print $4}')
-            if [[ ! "$boot_free_kb" =~ ^[0-9]+$ ]]; then
+            if [[ ! "$boot_free_kb" =~ ^[0-9]+$ ]] && ! $DAEMON_MODE; then
                 boot_free_kb=$(sudo -n env LC_ALL=C df -Pk "$boot_target" 2>/dev/null | awk 'NR==2 {print $4}')
             fi
             if [[ "$boot_free_kb" =~ ^[0-9]+$ ]] && (( boot_free_kb < 65536 )); then
@@ -4129,7 +4197,7 @@ printf "${dim}%s${reset}\n" "$sep_line"
 
 env LC_ALL=C sort -n "$OUTPUT_FILE" | while IFS=$'\t' read -r key diff_hours pkg_level upd_type pkgname old_ver new_ver repo size is_explicit epoch_new fmt_date_new desc; do
 
-    if (( diff_hours == 9999 )); then age_disp="[?]"; age_col=$dim
+    if (( diff_hours == 336 )); then age_disp="[?]"; age_col=$dim
     else
         age_disp="[${diff_hours}h]"
         if (( diff_hours < 12 )); then age_col="${red}${bold}"
@@ -4560,8 +4628,9 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
         RUN_STANDARD=false
 
         has_pkg_mgr=false
+        pkg_mgr_re='(^|[^[:alnum:]_-])(pacman|yay|paru|eos-update|cachy-update|arch-update|topgrade|pikaur|trizen|aura|pacaur|pakku|rua)([^[:alnum:]_-]|$)'
         for cmd in "${CUSTOM_CMDS[@]}"; do
-            if [[ "$cmd" =~ (pacman|yay|paru|eos-update|cachy-update|arch-update|topgrade|pikaur|trizen|aura|pacaur|pakku|rua) ]]; then
+            if [[ "$cmd" =~ $pkg_mgr_re ]]; then
                 has_pkg_mgr=true
                 break
             fi
