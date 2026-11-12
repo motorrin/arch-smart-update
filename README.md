@@ -92,20 +92,22 @@ Whenever the master configuration on GitHub is updated, the script will quietly 
 
 The script relies on standard Arch base system utilities:
 
-`sudo pacman -S bash python pacman pacman-contrib tar gawk coreutils curl zstd grep sed`
+`sudo pacman -S --needed bash python tar gawk coreutils findutils diffutils util-linux procps-ng curl zstd grep sed`
 
 **Optional Dependencies:**
 - `base-devel` (specifically `fakeroot`) — Required for the background daemon to safely synchronize databases without sudo.
 - `libnotify` — Required for interactive desktop notifications in daemon mode.
-- `util-linux` — Provides `script` for clean terminal log captures, `flock` for daemon concurrency locking, and `setsid` for detached processes.
 - `xdg-utils` / `xdg-terminal-exec` — For opening Arch News links in your default browser (`xdg-open`) and launching the default terminal emulator from notifications.
 - `rate-mirrors` — Fast primary ranking tool for official Arch Linux mirrors.
 - `reflector` — Fallback ranking tool for official Arch Linux mirrors.
 - `eos-rankmirrors` / `cachyos-rate-mirrors` — For ranking distribution-specific repositories on EndeavourOS and CachyOS.
+- `eos-update` / `cachy-update` / `arch-update` — Distribution/helper wrappers used for core repository updates when installed.
+- `topgrade` — Enables comprehensive secondary updates (firmware, Flatpaks, dotfiles, etc.).
 - `rebuild-detector` — Provides `checkrebuild` to identify foreign AUR packages requiring recompilation against updated libraries.
 - `flatpak` — Enables automated removal of unused Flatpak runtimes during post-update cleanup.
 - `gamemode` — Automatically postpones background update checks while gaming.
 - `snap-pac` — Triggers automated pre/post Btrfs snapshots on update (if using Snapper).
+- `psmisc` — Provides `fuser` for alternative pacman lock-file detection.
 - `yay` / `paru` / `pikaur` / `aura` / `rua` / `trizen` / `pacaur` / `pakku` — For managing foreign AUR packages.
 
 <a name="installation"></a>
