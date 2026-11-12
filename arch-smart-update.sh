@@ -700,7 +700,7 @@ log_step() {
     echo -e "${dim}[$(date +%T)] ${1:-}${reset}"
 }
 
-for cmd in python3 tar awk stat curl zstd sha256sum grep sed vercmp; do
+for cmd in python3 tar awk stat curl zstd sha256sum grep sed vercmp tac; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         echo -e "${red}Error: Required command '$cmd' is not installed.${reset}"
         exit 1
@@ -1156,8 +1156,7 @@ sync_daemon_state() {
             START_DELAY_VAL="${START_DELAY_VAL}min"
         fi
 
-        export SCRIPT_PATH START_DELAY="$START_DELAY_VAL" CURRENT_INTERVAL
-        awk -v svc="$TMP_SVC" -v tmr="$TMP_TMR" '
+        SCRIPT_PATH="$SCRIPT_PATH" START_DELAY="$START_DELAY_VAL" CURRENT_INTERVAL="$CURRENT_INTERVAL" awk -v svc="$TMP_SVC" -v tmr="$TMP_TMR" '
             BEGIN {
                 script = ENVIRON["SCRIPT_PATH"]
                 delay = ENVIRON["START_DELAY"]
@@ -1828,7 +1827,7 @@ def strip_quotes_preserve_length(s):
             in_dquote = not in_dquote
             chars[i] = ' '
         elif char == "'" and not in_dquote:
-            in_squote = not in_dquote
+            in_squote = not in_squote
             chars[i] = ' '
         elif in_dquote or in_squote:
             chars[i] = ' '
@@ -1851,7 +1850,7 @@ def clean_comment_and_quotes(s):
         if char == '"' and not in_squote:
             in_dquote = not in_dquote
         elif char == "'" and not in_dquote:
-            in_squote = not in_dquote
+            in_squote = not in_squote
         elif char == chr(35) and not in_dquote and not in_squote:
             break
         clean += char
@@ -2568,13 +2567,11 @@ if [[ -n "$SETTINGS_CONF" && -f "$SETTINGS_CONF" ]]; then
 
     mapfile -t CUSTOM_CMDS < <(parse_bash_array "$SETTINGS_CONF" "CUSTOM_CMDS")
 
-    [[ "$T_MIRROR_H" =~ ^[0-9]+$ ]] || T_MIRROR_H="$DEFAULT_T_MIRROR_H"
-    [[ "$T_FEAT_H" =~ ^[0-9]+$ ]] || T_FEAT_H="$DEFAULT_T_FEAT_H"
-    [[ "$T_CRIT_H" =~ ^[0-9]+$ ]] || T_CRIT_H="$DEFAULT_T_CRIT_H"
-    [[ "$T_DE_H" =~ ^[0-9]+$ ]] || T_DE_H="$DEFAULT_T_DE_H"
-    [[ "$T_NUKE_H" =~ ^[0-9]+$ ]] || T_NUKE_H="$DEFAULT_T_NUKE_H"
-    [[ "$MIN_DISK_SPACE_MB" =~ ^[0-9]+$ ]] || MIN_DISK_SPACE_MB="$DEFAULT_MIN_DISK_SPACE_MB"
-    [[ "$MIN_BTRFS_SPACE_MB" =~ ^[0-9]+$ ]] || MIN_BTRFS_SPACE_MB="$DEFAULT_MIN_BTRFS_SPACE_MB"
+    for numeric_key in T_MIRROR_H T_FEAT_H T_CRIT_H T_DE_H T_NUKE_H MIN_DISK_SPACE_MB MIN_BTRFS_SPACE_MB MAX_BACKUP_COPIES MAX_LOG_NUMBERS; do
+        default_ref="DEFAULT_${numeric_key}"
+        [[ "${!numeric_key}" =~ ^[0-9]{1,9}$ ]] || printf -v "$numeric_key" '%s' "${!default_ref}"
+        printf -v "$numeric_key" '%s' "$(( 10#${!numeric_key} ))"
+    done
     [[ -z "${CHECK_INTERVAL:-}" ]] && CHECK_INTERVAL="$DEFAULT_CHECK_INTERVAL"
     [[ -z "${START_DELAY:-}" ]] && START_DELAY="$DEFAULT_START_DELAY"
     [[ -z "${SILENCE_UPDATES:-}" ]] && SILENCE_UPDATES="$DEFAULT_SILENCE_UPDATES"
@@ -2875,13 +2872,16 @@ backup_pacman_db() {
     if [[ ! -d "$BACKUP_DIR" ]]; then
         sudo mkdir -p "$BACKUP_DIR"
     fi
+    sudo find "$BACKUP_DIR" -maxdepth 1 -type f -name 'pacman_database_*.tar.zst.part' -mmin +5 -delete 2>/dev/null
     local BACKUP_DATE
     BACKUP_DATE=$(date +%Y%m%d_%H%M%S)
     local BACKUP_FILE="$BACKUP_DIR/pacman_database_$BACKUP_DATE.tar.zst"
-    if sudo tar --xattrs --warning=no-file-changed -I 'zstd -3' -cf "$BACKUP_FILE" -C /var/lib/pacman/ local; then
+    local BACKUP_PART="$BACKUP_FILE.part"
+    if sudo tar --xattrs --warning=no-file-changed -I 'zstd -3' -cf "$BACKUP_PART" -C /var/lib/pacman/ local && sudo mv -f -- "$BACKUP_PART" "$BACKUP_FILE"; then
         echo -e "${green}Backup created: ${white}$(basename "$BACKUP_FILE")${reset}"
         sudo bash -c "find \"$BACKUP_DIR\" -maxdepth 1 -type f \( -name 'pacman_database_*.tar.zst' -o -name 'pacman_database_*.tar.gz' \) -printf '%T@\t%p\0' 2>/dev/null | sort -z -rn | tail -z -n +$((KEEP_COPIES + 1)) | cut -z -f2- | xargs -0 -r rm -f --"
     else
+        sudo rm -f -- "$BACKUP_PART" "$BACKUP_FILE" 2>/dev/null
         echo -e "${red}Failed to create backup!${reset}"
         echo -ne "${yellow}Continue anyway? [y/N]: ${reset}"
         local cont
@@ -2999,13 +2999,13 @@ check_reboot_needed() {
     boot_ts=$(awk '/^btime/ {print $2}' /proc/stat 2>/dev/null)
     [[ -z "$boot_ts" || ! "$boot_ts" =~ ^[0-9]+$ ]] && return 0
     
-    local read_cmd=(tail -n 4000 "$log_file")
+    local read_cmd=(tac "$log_file")
     if [[ ! -r "$log_file" ]]; then
-        read_cmd=(sudo tail -n 4000 "$log_file")
+        read_cmd=(sudo tac "$log_file")
     fi
     
     local updated_pkgs
-    updated_pkgs=$("${read_cmd[@]}" 2>/dev/null | awk -v boot_ts="$boot_ts" -v crit="$critical_pkgs" '
+    updated_pkgs=$("${read_cmd[@]}" 2>/dev/null | awk -v boot_ts="$boot_ts" -v crit="$critical_pkgs" -v skip='(-headers|-docs|-protocols)$' '
         / upgraded | installed | downgraded / {
             idx1 = index($0, "[")
             idx2 = index($0, "]")
@@ -3016,6 +3016,7 @@ check_reboot_needed() {
                 if (!d[6]) d[6] = "00"
                 spec = sprintf("%04d %02d %02d %02d %02d %02d", d[1], d[2], d[3], d[4], d[5], d[6])
                 epoch = mktime(spec)
+                if (epoch > 0 && epoch <= boot_ts) exit
                 if (epoch > boot_ts) {
                     pkg_name = ""
                     for (i = 1; i <= NF; i++) {
@@ -3024,7 +3025,7 @@ check_reboot_needed() {
                             break
                         }
                     }
-                    if (pkg_name != "" && pkg_name ~ crit) {
+                    if (pkg_name != "" && pkg_name ~ crit && pkg_name !~ skip) {
                         pkgs[pkg_name] = 1
                     }
                 }
@@ -4059,6 +4060,10 @@ while read -r pkgname old_ver _ new_ver _rest; do
 
     IFS='|' read -r repo date_new size desc <<< "${NEW_DATA[$pkgname]:-}"
     IFS='|' read -r _ reason <<< "${OLD_DATA[$pkgname]:-}"
+    repo="${repo:-?}"
+    size="${size:-N/A}"
+    old_ver="${old_ver:-?}"
+    new_ver="${new_ver:-?}"
 
     is_explicit=0
     [[ "$reason" == *"Explicitly"* ]] && is_explicit=1
@@ -4107,6 +4112,8 @@ while read -r pkgname old_ver _ new_ver _rest; do
     upd_type=$(get_update_type "$old_ver" "$new_ver" "$pkg_level")
 
     sort_key=$(printf "%d.%05d" "$pkg_level" "$diff_hours")
+    fmt_date_new="${fmt_date_new:-N/A}"
+    [[ "$epoch_new" =~ ^[0-9]+$ ]] || epoch_new=0
 
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$sort_key" "$diff_hours" "$pkg_level" "$upd_type" "$pkgname" "$old_ver" "$new_ver" \
@@ -5030,9 +5037,12 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
             fi
 
             echo -e "${dim}Clearing partial downloads and package cache...${reset}"
-            sudo rm -rf /var/cache/pacman/pkg/download-* 2>/dev/null
+            pkg_cache_dir=$(pacman-conf CacheDir 2>/dev/null | head -n 1)
+            pkg_cache_dir="${pkg_cache_dir%/}"
+            [[ -z "$pkg_cache_dir" ]] && pkg_cache_dir="/var/cache/pacman/pkg"
+            sudo rm -rf -- "${pkg_cache_dir:?}"/download-* 2>/dev/null
             if [[ -n "$AUR_HELPER" ]]; then
-                $AUR_HELPER -Sc --noconfirm >/dev/null 2>&1
+                "${HELPER_CMD[@]}" -Sc --noconfirm >/dev/null 2>&1
             else
                 sudo pacman -Sc --noconfirm >/dev/null 2>&1
             fi
@@ -5058,7 +5068,7 @@ if [[ "$answer" =~ ^[Yy]$ || -z "$answer" ]]; then
                             echo -e "${dim}Clearing AUR helper build caches...${reset}"
                             cleaned_aur="true"
                         fi
-                        rm -rf -- "${user_cache_dir:?}/${h:?}" 2>/dev/null
+                        find "${user_cache_dir:?}/${h:?}" -mindepth 1 -maxdepth 1 ! -name 'vcs.json' ! -name 'devel.json' -exec rm -rf -- {} + 2>/dev/null
                     fi
                 done
 
@@ -5128,6 +5138,11 @@ else
 fi
 
 if [[ "$DAEMON_MODE" == "false" ]] && [ -t 0 ]; then
+    if [[ -n "${SUDO_KEEP_ALIVE_PID:-}" ]]; then
+        kill "$SUDO_KEEP_ALIVE_PID" 2>/dev/null
+        { wait "$SUDO_KEEP_ALIVE_PID"; } 2>/dev/null
+        SUDO_KEEP_ALIVE_PID=""
+    fi
     if [[ "${GENERATE_LOGS,,}" == "true" && -n "${LOG_FILE:-}" ]]; then
         echo -e "${green}Log was written to ${white}$LOG_FILE${reset}"
     fi
